@@ -453,7 +453,9 @@ _dor_list_running_tasks() {
 # --- diagnostic: run find_stuck_oom_processes on one instance via SSM --------
 _dor_run_remote() {
 	local instance="$1" pattern="$2" extra="$3"
-	local func_src remote_script params cmd_id status out tries=0
+	# NB: avoid the name `status` -- it is a read-only special variable in zsh
+	# (an alias for $?), and assigning to it aborts the function mid-poll.
+	local func_src remote_script params cmd_id inv_status out tries=0
 
 	func_src="$(declare -f find_stuck_oom_processes)" || return 1
 	remote_script="set -u
@@ -473,9 +475,9 @@ find_stuck_oom_processes ${extra} $(printf '%q' "$pattern")"
 
 	while [ "$tries" -lt 100 ]; do
 		tries=$((tries + 1))
-		status="$(aws ssm get-command-invocation --command-id "$cmd_id" \
+		inv_status="$(aws ssm get-command-invocation --command-id "$cmd_id" \
 			--instance-id "$instance" --query 'Status' --output text 2>/dev/null </dev/null)"
-		case "$status" in
+		case "$inv_status" in
 		Success | Failed | Cancelled | TimedOut) break ;;
 		*) sleep 3 ;;
 		esac
@@ -483,7 +485,7 @@ find_stuck_oom_processes ${extra} $(printf '%q' "$pattern")"
 	out="$(aws ssm get-command-invocation --command-id "$cmd_id" \
 		--instance-id "$instance" --query 'StandardOutputContent' --output text 2>/dev/null </dev/null)"
 	printf '%s\n' "$out"
-	[ "$status" = "Success" ]
+	[ "$inv_status" = "Success" ]
 }
 
 # --- diagnostic: diagnose a set of tasks -------------------------------------
@@ -546,7 +548,14 @@ _dor_diagnose_tasks() {
 	intasks="$(mktemp)"
 	qcache="$(mktemp)"
 	mapf="$(mktemp)"
-	trap 'rm -f "$intasks" "$qcache" "$mapf"' RETURN
+	# Clean up temp files when this function returns. bash uses the RETURN
+	# pseudo-signal; zsh has no RETURN trap, but an EXIT trap set inside a
+	# function is function-local there and fires on return -- so pick per shell.
+	if [ -n "${ZSH_VERSION:-}" ]; then
+		trap 'rm -f "$intasks" "$qcache" "$mapf"' EXIT
+	else
+		trap 'rm -f "$intasks" "$qcache" "$mapf"' RETURN
+	fi
 
 	# gather input: from args (label = id) or stdin ("<id><TAB><label>")
 	if [ ${#native_ids[@]} -gt 0 ]; then
