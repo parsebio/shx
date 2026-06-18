@@ -747,6 +747,139 @@ _dor_main() {
 }
 
 # =============================================================================
+# Public: find which workflow/run owns a task with a given tag
+# -----------------------------------------------------------------------------
+# Usage:
+#   find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
+#     --status S   only scan workflows in status S (default RUNNING; ALL = any)
+#     --max N      scan at most N workflows (default 200)
+#     --all        report every matching run (default: stop at the first)
+#
+# Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
+# =============================================================================
+find_run_by_task_tag() {
+	local status_filter="RUNNING" max_wf=200 find_all=0 tag=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--status)
+			[ -n "${2:-}" ] || {
+				printf 'Error: --status requires a value.\n' >&2
+				return 2
+			}
+			status_filter="$2"
+			shift 2
+			;;
+		--status=*)
+			status_filter="${1#*=}"
+			shift
+			;;
+		--max)
+			[ -n "${2:-}" ] || {
+				printf 'Error: --max requires a value.\n' >&2
+				return 2
+			}
+			max_wf="$2"
+			shift 2
+			;;
+		--max=*)
+			max_wf="${1#*=}"
+			shift
+			;;
+		--all)
+			find_all=1
+			shift
+			;;
+		-h | --help)
+			printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>\n'
+			return 0
+			;;
+		-*)
+			printf 'Unknown option: %s\n' "$1" >&2
+			return 2
+			;;
+		*)
+			if [ -n "$tag" ]; then
+				printf 'Error: too many arguments.\n' >&2
+				return 2
+			fi
+			tag="$1"
+			shift
+			;;
+		esac
+	done
+
+	[ -z "$tag" ] && {
+		printf 'Error: missing required <tag> argument.\n' >&2
+		printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>\n' >&2
+		return 2
+	}
+	_dor_preflight curl jq awk || return 1
+
+	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
+	local ep="${API_ENDPOINT%/}"
+	local offset=0 wtotal page rows found=0
+	local wid wname wstatus tpage matches
+
+	printf '==> Scanning %s workflow(s) for a task tagged like "%s"...\n' \
+		"$status_filter" "$tag" >&2
+
+	while [ "$offset" -lt "$max_wf" ]; do
+		page="$(curl -fsSL --get "${auth[@]}" \
+			--data-urlencode "max=100" \
+			--data-urlencode "offset=$offset" \
+			--data-urlencode "workspaceId=$WORKSPACE_ID" \
+			"$ep/workflow")" || {
+			printf 'find_run_by_task_tag: workflow list request failed at offset %s.\n' "$offset" >&2
+			return 1
+		}
+
+		wtotal="$(jq -r '.totalSize // .total // 0' <<<"$page")"
+		rows="$(jq -r '.workflows[].workflow | "\(.id)\t\(.runName)\t\(.status)"' <<<"$page")"
+		[ -z "$rows" ] && break
+
+		while IFS=$'\t' read -r wid wname wstatus; do
+			[ -z "$wid" ] && continue
+			if [ "$status_filter" != "ALL" ] && [ "$wstatus" != "$status_filter" ]; then
+				continue
+			fi
+
+			# Server-side search narrows the task set; confirm the tag client-side.
+			tpage="$(curl -fsSL --get "${auth[@]}" \
+				--data-urlencode "max=100" \
+				--data-urlencode "search=$tag" \
+				--data-urlencode "workspaceId=$WORKSPACE_ID" \
+				"$ep/workflow/$wid/tasks")" || continue
+			matches="$(jq -r --arg t "$tag" '
+				.tasks[]? | (.task // .)
+				| select((.tag // "") | contains($t))
+				| "\(.nativeId)\t\(.tag)\t\(.process)\t\(.status)"' <<<"$tpage")"
+
+			if [ -n "$matches" ]; then
+				found=1
+				printf '\n=== MATCH ===\n'
+				printf '  workflow id : %s\n' "$wid"
+				printf '  run name    : %s\n' "$wname"
+				printf '  run status  : %s\n' "$wstatus"
+				printf '  matching task(s):\n'
+				printf '%s\n' "$matches" | awk -F'\t' \
+					'{printf "    - nativeId=%s  tag=%s  step=%s  status=%s\n", $1, $2, $3, $4}'
+				[ "$find_all" -eq 0 ] && return 0
+			fi
+		done <<<"$rows"
+
+		offset=$((offset + 100))
+		[ "$offset" -ge "$wtotal" ] && break
+	done
+
+	if [ "$found" -eq 0 ]; then
+		printf 'No %s workflow with a task tagged like "%s" found (scanned up to %s).\n' \
+			"$status_filter" "$tag" "$max_wf" >&2
+		printf 'Broaden the search, e.g.: find_run_by_task_tag --status ALL --max 1000 %q\n' "$tag" >&2
+		return 1
+	fi
+}
+
+# =============================================================================
 # Public script entry point
 # -----------------------------------------------------------------------------
 # This is the single place where externally callable commands are listed.
@@ -768,11 +901,18 @@ Commands:
   diagnose_oom_run ...
       Orchestrate run/workflow/task OOM diagnosis.
 
+  find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
+      Find which workflow/run owns a task with the given tag.
+
+  star_progress --fastq FILE --progress-file FILE [--sample-reads N]
+      Estimate STAR alignment progress and ETA from its Log.progress.out.
+
   help
       Show this help message.
 
 Compatibility aliases:
-  aws-ssh-job-instance, find-stuck-oom-processes, diagnose-oom-run
+  aws-ssh-job-instance, find-stuck-oom-processes, diagnose-oom-run,
+  find-run-by-task-tag, star-progress
 EOF
 }
 
@@ -796,6 +936,14 @@ _xsh_main() {
 		shift
 		_dor_main "$@"
 		;;
+	find_run_by_task_tag | find-run-by-task-tag)
+		shift
+		find_run_by_task_tag "$@"
+		;;
+	star_progress | star-progress)
+		shift
+		star_progress "$@"
+		;;
 	*)
 		printf 'x.sh: unknown command: %s\n\n' "$entrypoint" >&2
 		_xsh_usage >&2
@@ -804,6 +952,25 @@ _xsh_main() {
 	esac
 }
 
+# =============================================================================
+# Public: estimate STAR alignment progress and ETA
+# -----------------------------------------------------------------------------
+# STAR writes a running counter to its Log.progress.out, but reports neither a
+# percentage nor a finish time because it never knows the total read count up
+# front. This estimates both: it samples the first --sample-reads records of the
+# input FASTQ to derive average bytes/read, scales that by the full file size to
+# estimate the total read count, then combines that with the reads-processed and
+# reads/hour figures from the last line of the progress log to print percent
+# complete, reads remaining, and an ETA.
+#
+# Usage:
+#   star_progress --fastq FILE --progress-file FILE [--sample-reads N]
+#     --fastq FILE          Input FASTQ fed to STAR (sampled for size estimation)
+#     --progress-file FILE  STAR Log.progress.out to read the latest counters from
+#     --sample-reads N      Reads to sample for the bytes/read estimate (default 100000)
+#
+# Note: uses `stat -c` (GNU/Linux); intended to run on the compute host.
+# =============================================================================
 star_progress() {
 	local fastq=""
 	local progress_file=""
