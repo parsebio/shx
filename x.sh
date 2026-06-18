@@ -804,6 +804,127 @@ _xsh_main() {
 	esac
 }
 
+star_progress() {
+	local fastq=""
+	local progress_file=""
+	local sample_reads=100000
+
+	usage() {
+		cat <<EOF
+Usage:
+  star_progress --fastq FILE --progress-file FILE [OPTIONS]
+
+Required:
+  --fastq FILE            Input FASTQ file
+  --progress-file FILE    Log progress file
+
+Optional:
+  --sample-reads N        Number of reads to sample for size estimation
+                          (default: 100000)
+
+  -h, --help              Show this help message
+
+Examples:
+  star_progress \
+    --fastq barcode_head.fastq \
+    --progress-file barcode_headLog.progress.out
+
+  star_progress \
+    --fastq barcode_head.fastq \
+    --progress-file barcode_headLog.progress.out \
+    --sample-reads 500000
+EOF
+	}
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--fastq)
+			fastq="$2"
+			shift 2
+			;;
+		--progress-file)
+			progress_file="$2"
+			shift 2
+			;;
+		--sample-reads)
+			sample_reads="$2"
+			shift 2
+			;;
+		-h | --help)
+			usage
+			return 0
+			;;
+		*)
+			echo "Unknown option: $1" >&2
+			usage >&2
+			return 1
+			;;
+		esac
+	done
+
+	[[ -z "$fastq" ]] && {
+		echo "Missing required argument: --fastq" >&2
+		usage >&2
+		return 1
+	}
+
+	[[ -z "$progress_file" ]] && {
+		echo "Missing required argument: --progress-file" >&2
+		usage >&2
+		return 1
+	}
+
+	[[ ! -f "$fastq" ]] && {
+		echo "FASTQ not found: $fastq" >&2
+		return 1
+	}
+
+	[[ ! -f "$progress_file" ]] && {
+		echo "Progress file not found: $progress_file" >&2
+		return 1
+	}
+
+	local processed
+	processed=$(tail -1 "$progress_file" | awk '{print $5}')
+
+	local speed
+	speed=$(tail -1 "$progress_file" | awk '{print $4}')
+
+	local bytes
+	bytes=$(head -n $((sample_reads * 4)) "$fastq" | wc -c)
+
+	local size
+	size=$(stat -c %s "$fastq")
+
+	local estimated_total
+	# estimated_total_reads = total_file_size / average_bytes_per_read
+	estimated_total=$(awk \
+		-v b="$bytes" \
+		-v s="$size" \
+		-v r="$sample_reads" \
+		'BEGIN { printf "%.0f", s/(b/r) }')
+
+	awk \
+		-v p="$processed" \
+		-v t="$estimated_total" \
+		-v speed="$speed" '
+    BEGIN {
+        speed_reads_per_hour = speed * 1000000
+
+        pct = 100 * p / t
+        rem = t - p
+        eta = rem / speed_reads_per_hour
+
+        printf "FASTQ size      : %.2f GB\n", ENVIRON["size"] / 1024 / 1024 / 1024
+        printf "STAR speed      : %.1f M reads/hour\n", speed
+        printf "Processed reads : %'\''d\n", p
+        printf "Estimated total : %'\''d\n", t
+        printf "Progress        : %.2f%%\n", pct
+        printf "Remaining reads : %'\''d\n", rem
+        printf "ETA             : %.1f hours\n", eta
+    }' size="$size"
+}
+
 # Source-compatible wrapper for existing users.
 diagnose_oom_run() {
 	_dor_main "$@"
