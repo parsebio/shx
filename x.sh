@@ -1074,7 +1074,8 @@ EOF
 	awk \
 		-v p="$processed" \
 		-v t="$estimated_total" \
-		-v speed="$speed" '
+		-v speed="$speed" \
+		-v size="$size" '
     BEGIN {
         speed_reads_per_hour = speed * 1000000
 
@@ -1082,14 +1083,14 @@ EOF
         rem = t - p
         eta = rem / speed_reads_per_hour
 
-        printf "FASTQ size      : %.2f GB\n", ENVIRON["size"] / 1024 / 1024 / 1024
+        printf "FASTQ size      : %.2f GB\n", size / 1024 / 1024 / 1024
         printf "STAR speed      : %.1f M reads/hour\n", speed
         printf "Processed reads : %'\''d\n", p
         printf "Estimated total : %'\''d\n", t
         printf "Progress        : %.2f%%\n", pct
         printf "Remaining reads : %'\''d\n", rem
         printf "ETA             : %.1f hours\n", eta
-    }' size="$size"
+    }'
 }
 
 # Source-compatible wrapper for existing users.
