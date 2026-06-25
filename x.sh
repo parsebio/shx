@@ -934,6 +934,10 @@ Commands:
       instance, then docker exec into the task container and run
       show_star_progress on the task's barcode_head FASTQ + progress file.
 
+  show_samtools_sort_progress --pid PID [--interval S] [--window N] [--out-gb GB]
+      Live whole-job progress + ETA for a running `samtools sort` (Linux;
+      reads /proc/<pid>). Run on the host where the process lives.
+
   help
       Show this help message.
 
@@ -978,6 +982,10 @@ _xsh_main() {
 	show_task_star_progress | show-task-star-progress | star_progress_task | star-progress-task)
 		shift
 		show_task_star_progress "$@"
+		;;
+	show_samtools_sort_progress | show-samtools-sort-progress)
+		shift
+		show_samtools_sort_progress "$@"
 		;;
 	*)
 		printf 'x.sh: unknown command: %s\n\n' "$entrypoint" >&2
@@ -1133,9 +1141,8 @@ EOF
 # -----------------------------------------------------------------------------
 # Ties the pieces together so you never assemble the FASTQ / progress-file paths
 # by hand. Given a workflow ID and a task's nativeId (AWS Batch job UUID) it:
-#   1. resolves the task's work directory AND container image via the Tower API
-#      (same backend `tw` talks to; reuses this toolbox's API_* env so no
-#      separate TOWER_* setup),
+#   1. resolves the task's work directory AND container image via the API
+#      (same backend talks to; reuses this toolbox's API_* env so no),
 #   2. traces the nativeId to its backing EC2 instance (_aws_batch_job_to_ec2),
 #   3. on that host, finds the running task container by its image tag
 #      (sudo docker ps | grep <tag>), then `docker exec`s into it and there
@@ -1358,6 +1365,305 @@ EOF
 
 	printf '==> Running show_star_progress inside the task container on %s...\n' "$ec2" >&2
 	_sp_run_remote "$ec2" "$image" "$workdir"
+}
+
+# =============================================================================
+# Public: whole-job progress + ETA for a running `samtools sort`
+# -----------------------------------------------------------------------------
+# A name-sort runs in two phases:
+#   1. READ/SORT : streams the input, writing sorted temp chunks (-T prefix).
+#   2. MERGE     : merges those chunks into the -o output file.
+# This measures BOTH and combines them into one overall figure:
+#
+#     done  = bytes_read (input offset)  +  bytes_written (output size)
+#     total = input_size                 +  output_target
+#     overall% = done / total
+#
+# Printed every --interval seconds until Ctrl+C:
+#
+#   [ts] overall P% (D/T GB) [phase] | chunks N | avg(K) R MB/s -> ETA | now R MB/s -> ETA
+#
+#   phase   : reading | merging | finalizing(cpu) | done
+#   avg(K)  : smoothed moving average of the overall rate over the last
+#             --window samples (kept history). Bigger window = smoother/laggier.
+#   now     : instantaneous overall rate over the most recent interval.
+#
+# Notes:
+#  * output_target is estimated as the input size (override with --out-gb).
+#    The %/ETA are approximate around the read->merge handoff and during the
+#    CPU-bound in-memory final sort (rate goes ~0 -> ETA shows n/a, by design).
+#  * Linux-only: reads /proc/<pid>/{cmdline,fd,fdinfo}; needs bash 4+. Run it on
+#    the host (or inside the container) where the samtools sort process lives.
+#
+# Usage:
+#   show_samtools_sort_progress --pid PID [--interval SECONDS] [--window SAMPLES] [--out-gb GB]
+#   show_samtools_sort_progress -p PID [-i SECONDS] [-w SAMPLES] [-o GB]
+#
+#   --pid,      -p   process id of the samtools sort        (REQUIRED)
+#   --interval, -i   seconds between samples                (default 10)
+#   --window,   -w   samples in the smoothing window        (default 6)
+#   --out-gb,   -o   override estimated output size in GB   (default = input size)
+#   --help,     -h   show this help
+# =============================================================================
+show_samtools_sort_progress() {
+	local PID="" INTERVAL=10 WINDOW=6 OUT_GB=""
+
+	_spf_usage() {
+		cat <<'USAGE'
+Usage: show_samtools_sort_progress --pid PID [--interval SECONDS] [--window SAMPLES] [--out-gb GB]
+  --pid,      -p   process id of the samtools sort        (REQUIRED)
+  --interval, -i   seconds between samples                (default 10)
+  --window,   -w   samples in the smoothing window        (default 6)
+  --out-gb,   -o   override estimated output size in GB   (default = input size)
+  --help,     -h   show this help
+USAGE
+	}
+
+	# --- parse named parameters -------------------------------------------
+	while (($#)); do
+		case "$1" in
+		-p | --pid)
+			PID="$2"
+			shift 2
+			;;
+		-i | --interval)
+			INTERVAL="$2"
+			shift 2
+			;;
+		-w | --window)
+			WINDOW="$2"
+			shift 2
+			;;
+		-o | --out-gb)
+			OUT_GB="$2"
+			shift 2
+			;;
+		--pid=*)
+			PID="${1#*=}"
+			shift
+			;;
+		--interval=*)
+			INTERVAL="${1#*=}"
+			shift
+			;;
+		--window=*)
+			WINDOW="${1#*=}"
+			shift
+			;;
+		--out-gb=*)
+			OUT_GB="${1#*=}"
+			shift
+			;;
+		-h | --help)
+			_spf_usage
+			unset -f _spf_usage
+			return 0
+			;;
+		*)
+			echo "show_samtools_sort_progress: unknown option '$1'" >&2
+			_spf_usage
+			unset -f _spf_usage
+			return 2
+			;;
+		esac
+	done
+	unset -f _spf_usage
+
+	# --- validate ----------------------------------------------------------
+	[[ -n "$PID" ]] || {
+		echo "show_samtools_sort_progress: --pid is required" >&2
+		return 2
+	}
+	[[ "$PID" =~ ^[0-9]+$ ]] || {
+		echo "show_samtools_sort_progress: --pid must be an integer" >&2
+		return 2
+	}
+	[[ "$INTERVAL" =~ ^[0-9]+$ ]] || {
+		echo "show_samtools_sort_progress: --interval must be an integer" >&2
+		return 2
+	}
+	[[ "$WINDOW" =~ ^[0-9]+$ && "$WINDOW" -ge 1 ]] || {
+		echo "show_samtools_sort_progress: --window must be a positive integer" >&2
+		return 2
+	}
+	[[ -z "$OUT_GB" || "$OUT_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+		echo "show_samtools_sort_progress: --out-gb must be a number" >&2
+		return 2
+	}
+	[[ -d /proc/$PID ]] || {
+		echo "No process with PID $PID" >&2
+		return 1
+	}
+
+	# --- parse the samtools command line: input, output, temp prefix -------
+	local -a ARGS
+	local IN OUT="" TMP="" i
+	mapfile -d '' ARGS <"/proc/$PID/cmdline"
+	for ((i = 0; i < ${#ARGS[@]}; i++)); do
+		[[ "${ARGS[i]}" == "-o" ]] && OUT="${ARGS[i + 1]:-}"
+		[[ "${ARGS[i]}" == "-T" ]] && TMP="${ARGS[i + 1]:-}"
+	done
+	IN="${ARGS[-1]:-}"
+	[[ -n "$IN" && -e "$IN" ]] || {
+		echo "Could not determine input file (got '$IN')" >&2
+		return 1
+	}
+
+	local SIZE TARGET TOTAL
+	SIZE=$(stat -c %s "$IN")
+	if [[ -n "$OUT_GB" ]]; then
+		TARGET=$(awk "BEGIN{printf \"%d\", $OUT_GB*1e9}")
+	else
+		TARGET=$SIZE
+	fi
+	TOTAL=$((SIZE + TARGET))
+
+	# --- local helpers -----------------------------------------------------
+	_spf_find_fd() { # echo fd number pointing at input, or nothing
+		local l
+		for l in /proc/$PID/fd/*; do
+			[[ "$(readlink "$l" 2>/dev/null)" == "$IN" ]] && {
+				basename "$l"
+				return 0
+			}
+		done
+		return 1
+	}
+	_spf_chunks() { # count temp chunk files (excludes the output)
+		[[ -n "$TMP" ]] || {
+			echo 0
+			return
+		}
+		(
+			shopt -s nullglob
+			local f=("$TMP".*.bam)
+			echo "${#f[@]}"
+		)
+	}
+	_spf_eta() {
+		awk -v s="$1" 'BEGIN{
+			if (s < 0 || s == "" || s != s) { print "n/a"; exit }
+			h = int(s/3600); m = int((s%3600)/60); sec = int(s%60);
+			if (h > 0)      printf "%dh %dm %ds", h, m, sec;
+			else if (m > 0) printf "%dm %ds", m, sec;
+			else            printf "%ds", sec;
+		}'
+	}
+
+	local FD
+	FD=$(_spf_find_fd || true)
+
+	printf 'PID         : %s\n' "$PID"
+	printf 'input       : %s\n' "$IN"
+	printf 'output      : %s\n' "${OUT:-<unknown>}"
+	printf 'in size     : %.1f GB    output target: %.1f GB (estimate%s)\n' \
+		"$(awk "BEGIN{print $SIZE/1e9}")" "$(awk "BEGIN{print $TARGET/1e9}")" \
+		"$([[ -n "$OUT_GB" ]] && echo ', user-set')"
+	printf 'interval    : %ss   window: %s samples (~%ss)   Ctrl+C to stop\n' \
+		"$INTERVAL" "$WINDOW" "$((INTERVAL * WINDOW))"
+	echo "--------------------------------------------------------------------------------"
+
+	# Ctrl+C sets a flag (won't kill the shell when sourced)
+	local _spf_stop=0
+	trap '_spf_stop=1' INT
+
+	local -a hist_t=() hist_done=()
+	local now_t ts pos out chunks done pct gbdone gbtotal phase avg_str now_str
+	local prev_done="" prev_pos="" prev_t="" wt0 wd0
+
+	while ((_spf_stop == 0)); do
+		now_t=$(date +%s.%N)
+		ts=$(date +%H:%M:%S)
+
+		if [[ ! -d /proc/$PID ]]; then
+			echo "[$ts] process $PID no longer running — job finished or exited."
+			break
+		fi
+
+		# re-resolve input fd; it disappears when reading is fully done
+		if [[ -z "$FD" || "$(readlink "/proc/$PID/fd/$FD" 2>/dev/null)" != "$IN" ]]; then
+			FD=$(_spf_find_fd || true)
+		fi
+
+		# bytes read (input offset; clamp to SIZE; full size if fd already closed)
+		if [[ -n "$FD" && -r "/proc/$PID/fdinfo/$FD" ]]; then
+			pos=$(awk '/^pos:/{print $2}' "/proc/$PID/fdinfo/$FD")
+			((pos > SIZE)) && pos=$SIZE
+		else
+			pos=$SIZE
+		fi
+
+		# bytes written (output file size) + remaining temp chunks
+		out=0
+		[[ -n "$OUT" && -e "$OUT" ]] && out=$(stat -c %s "$OUT")
+		chunks=$(_spf_chunks)
+
+		done=$((pos + out))
+		((done > TOTAL)) && done=$TOTAL # guard if output exceeds the estimate
+
+		pct=$(awk "BEGIN{printf \"%.1f\", $done/$TOTAL*100}")
+		gbdone=$(awk "BEGIN{printf \"%.1f\", $done/1e9}")
+		gbtotal=$(awk "BEGIN{printf \"%.1f\", $TOTAL/1e9}")
+
+		# rolling history of overall `done` bytes
+		hist_t+=("$now_t")
+		hist_done+=("$done")
+		while ((${#hist_t[@]} > WINDOW)); do
+			hist_t=("${hist_t[@]:1}")
+			hist_done=("${hist_done[@]:1}")
+		done
+
+		# phase label from per-tick movement
+		if [[ -n "$prev_done" ]]; then
+			if [[ -n "$FD" ]] && ((pos > prev_pos && pos < SIZE)); then
+				phase="reading"
+			elif ((done > prev_done)); then
+				phase="merging"
+			elif ((done >= TOTAL)); then
+				phase="done"
+			else phase="finalizing(cpu)"; fi
+		else
+			{ [[ -n "$FD" ]] && ((pos < SIZE)); } && phase="reading" || phase="merging"
+		fi
+
+		# smoothed avg over the window
+		wt0="${hist_t[0]}"
+		wd0="${hist_done[0]}"
+		if ((${#hist_t[@]} >= 2)); then
+			local ar ae
+			ar=$(awk "BEGIN{dt=$now_t-$wt0; dp=$done-$wd0; printf \"%.1f\", (dt>0)?(dp/dt)/1e6:0}")
+			ae=$(awk "BEGIN{dt=$now_t-$wt0; dp=$done-$wd0; r=(dt>0)?dp/dt:0; print (r>0)?($TOTAL-$done)/r:-1}")
+			avg_str="avg(${#hist_t[@]}) ${ar} MB/s -> ETA $(_spf_eta "$ae")"
+		else
+			avg_str="avg (warming up)"
+		fi
+
+		# instantaneous
+		if [[ -n "$prev_done" ]]; then
+			local nr ne
+			nr=$(awk "BEGIN{dt=$now_t-$prev_t; dp=$done-$prev_done; printf \"%.1f\", (dt>0)?(dp/dt)/1e6:0}")
+			ne=$(awk "BEGIN{dt=$now_t-$prev_t; dp=$done-$prev_done; r=(dt>0)?dp/dt:0; print (r>0)?($TOTAL-$done)/r:-1}")
+			now_str="now ${nr} MB/s -> ETA $(_spf_eta "$ne")"
+		else
+			now_str="now (need one more sample)"
+		fi
+
+		printf '[%s] overall %5s%% (%s/%s GB) [%s] | chunks %s | %s | %s\n' \
+			"$ts" "$pct" "$gbdone" "$gbtotal" "$phase" "$chunks" "$avg_str" "$now_str"
+
+		if [[ "$phase" == "done" ]]; then
+			echo "[$ts] all bytes accounted for — sort should be wrapping up."
+		fi
+
+		prev_done=$done
+		prev_pos=$pos
+		prev_t=$now_t
+		sleep "$INTERVAL"
+	done
+
+	trap - INT
+	unset -f _spf_find_fd _spf_chunks _spf_eta
+	echo "stopped."
 }
 
 # Source-compatible wrapper for existing users.
