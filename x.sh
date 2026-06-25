@@ -9,11 +9,11 @@
 #   _xsh_main
 #
 # Source-compatible function names remain available:
-#   aws_ssh_job_instance, find_stuck_oom_processes, diagnose_oom_run
+#   open_task_shell, scan_oom_processes, diagnose_oom_run
 #
 # No code is duplicated: the Batch->ECS->EC2 trace lives once in
-# _aws_batch_job_to_ec2 (used by both aws_ssh_job_instance and the diagnoser),
-# and the on-host check is find_stuck_oom_processes, shipped to each instance via
+# _aws_batch_job_to_ec2 (used by both open_task_shell and the diagnoser),
+# and the on-host check is scan_oom_processes, shipped to each instance via
 # `declare -f` and run there as root over SSM.
 #
 # Required environment:
@@ -23,7 +23,7 @@
 #   PROC_PATTERN       Default remote process pattern for diagnosis.
 #
 # Requirements: awscli v2 configured for the target account/region; the SSM
-# Session Manager plugin (for aws_ssh_job_instance); jq, curl, awk.
+# Session Manager plugin (for open_task_shell); jq, curl, awk.
 # =============================================================================
 
 # =============================================================================
@@ -67,13 +67,60 @@ _aws_batch_job_to_ec2() {
 	printf '%s\n' "$ec2"
 }
 
+# Ship an arbitrary shell script to an instance via SSM, wait for it to finish,
+# and print its StandardOutputContent on stdout. Returns 0 only if the SSM
+# invocation reported Success. This is the single send-poll-collect path reused
+# by every remote command (scan_oom_processes, show_star_progress, ...).
+#   $1 = EC2 instance id
+#   $2 = shell script text (typically `declare -f` of a function plus a call)
+#   $3 = (optional) human-readable comment for the SSM command
+_xsh_ssm_run() {
+	local instance="$1" script="$2" comment="${3:-x.sh remote command}"
+	# NB: avoid the name `status` -- it is a read-only special variable in zsh
+	# (an alias for $?), and assigning to it aborts the function mid-poll.
+	local params cmd_id inv_status out tries=0 errf
+
+	# SSM caps --comment at 100 characters; over that, send-command rejects the
+	# whole call. Keep callers from tripping it regardless of what they pass.
+	comment="${comment:0:100}"
+
+	params="$(jq -n --arg c "$script" '{commands: [$c]}')"
+	errf="$(mktemp)"
+	cmd_id="$(aws ssm send-command --instance-ids "$instance" \
+		--document-name AWS-RunShellScript \
+		--comment "$comment" \
+		--parameters "$params" \
+		--query 'Command.CommandId' --output text 2>"$errf" </dev/null)"
+	if [ -z "$cmd_id" ] || [ "$cmd_id" = "None" ]; then
+		printf '(SSM send failed on %s)\n' "$instance"
+		sed 's/^/    aws: /' "$errf" >&2
+		rm -f "$errf"
+		return 1
+	fi
+	rm -f "$errf"
+
+	while [ "$tries" -lt 100 ]; do
+		tries=$((tries + 1))
+		inv_status="$(aws ssm get-command-invocation --command-id "$cmd_id" \
+			--instance-id "$instance" --query 'Status' --output text 2>/dev/null </dev/null)"
+		case "$inv_status" in
+		Success | Failed | Cancelled | TimedOut) break ;;
+		*) sleep 3 ;;
+		esac
+	done
+	out="$(aws ssm get-command-invocation --command-id "$cmd_id" \
+		--instance-id "$instance" --query 'StandardOutputContent' --output text 2>/dev/null </dev/null)"
+	printf '%s\n' "$out"
+	[ "$inv_status" = "Success" ]
+}
+
 # =============================================================================
 # Public: open an SSM session on the instance backing a Batch job
 # =============================================================================
-aws_ssh_job_instance() {
+open_task_shell() {
 	local usage
 	read -r -d '' usage <<'EOF' || true
-Usage: aws_ssh_job_instance [-h|--help] <job_id>
+Usage: open_task_shell [-h|--help] <job_id>
 
 Trace a task's Native ID to its underlying EC2 instance and open
 an SSM Session Manager session on it.
@@ -93,7 +140,7 @@ Requirements:
     and ssm:StartSession.
 
 Example:
-  aws_ssh_job_instance aa00a1e2-1e96-4cbb-a670-3b33c5ac356d
+  open_task_shell aa00a1e2-1e96-4cbb-a670-3b33c5ac356d
 EOF
 
 	# --- Parse arguments ------------------------------------------------------
@@ -151,12 +198,12 @@ EOF
 # zombie/defunct children).
 #
 # Usage:
-#   find_stuck_oom_processes [--all|-a] [--match|-m TAG] PATTERN
+#   scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN
 #   PATTERN is a 'pgrep -f' pattern (or set PROC_PATTERN).
 #
 # Tunables (env): CGROUP_ROOT (default /sys/fs/cgroup), PROC_PATTERN.
 # =============================================================================
-find_stuck_oom_processes() {
+scan_oom_processes() {
 	local cgroup_root="${CGROUP_ROOT:-/sys/fs/cgroup}"
 
 	# Default: show only STUCK matches. --all/-a shows every one.
@@ -183,7 +230,7 @@ find_stuck_oom_processes() {
 			shift
 			;;
 		-h | --help)
-			echo "Usage: find_stuck_oom_processes [--all|-a] [--match|-m TAG] PATTERN"
+			echo "Usage: scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN"
 			echo "  PATTERN          'pgrep -f' pattern for the process(es) to inspect"
 			echo "  (default)        print only STUCK matches"
 			echo "  --all            print every match regardless of verdict"
@@ -208,7 +255,7 @@ find_stuck_oom_processes() {
 
 	if [ -z "$proc_pattern" ]; then
 		echo "Error: no process PATTERN given (pass one as an argument or set PROC_PATTERN)." >&2
-		echo "Try: find_stuck_oom_processes --help" >&2
+		echo "Try: scan_oom_processes --help" >&2
 		return 2
 	fi
 
@@ -450,47 +497,22 @@ _dor_list_running_tasks() {
 	done
 }
 
-# --- diagnostic: run find_stuck_oom_processes on one instance via SSM --------
+# --- diagnostic: run scan_oom_processes on one instance via SSM --------
 _dor_run_remote() {
 	local instance="$1" pattern="$2" extra="$3"
-	# NB: avoid the name `status` -- it is a read-only special variable in zsh
-	# (an alias for $?), and assigning to it aborts the function mid-poll.
-	local func_src remote_script params cmd_id inv_status out tries=0
+	local func_src remote_script
 
-	func_src="$(declare -f find_stuck_oom_processes)" || return 1
+	func_src="$(declare -f scan_oom_processes)" || return 1
 	remote_script="set -u
 ${func_src}
-find_stuck_oom_processes ${extra} $(printf '%q' "$pattern")"
-	params="$(jq -n --arg c "$remote_script" '{commands: [$c]}')"
+scan_oom_processes ${extra} $(printf '%q' "$pattern")"
 
-	cmd_id="$(aws ssm send-command --instance-ids "$instance" \
-		--document-name AWS-RunShellScript \
-		--comment "find_stuck_oom_processes $pattern" \
-		--parameters "$params" \
-		--query 'Command.CommandId' --output text 2>/dev/null </dev/null)"
-	[ -z "$cmd_id" ] || [ "$cmd_id" = "None" ] && {
-		printf '(SSM send failed on %s)\n' "$instance"
-		return 1
-	}
-
-	while [ "$tries" -lt 100 ]; do
-		tries=$((tries + 1))
-		inv_status="$(aws ssm get-command-invocation --command-id "$cmd_id" \
-			--instance-id "$instance" --query 'Status' --output text 2>/dev/null </dev/null)"
-		case "$inv_status" in
-		Success | Failed | Cancelled | TimedOut) break ;;
-		*) sleep 3 ;;
-		esac
-	done
-	out="$(aws ssm get-command-invocation --command-id "$cmd_id" \
-		--instance-id "$instance" --query 'StandardOutputContent' --output text 2>/dev/null </dev/null)"
-	printf '%s\n' "$out"
-	[ "$inv_status" = "Success" ]
+	_xsh_ssm_run "$instance" "$remote_script" "scan_oom_processes $pattern"
 }
 
 # --- diagnostic: diagnose a set of tasks -------------------------------------
 # Reads "<nativeId>\t<label>" lines on stdin (or takes native IDs as args),
-# groups by EC2 instance, runs find_stuck_oom_processes on each.
+# groups by EC2 instance, runs scan_oom_processes on each.
 _dor_diagnose_tasks() {
 	local pattern="${PROC_PATTERN:-}" show_all=""
 	local -a native_ids=()
@@ -538,8 +560,8 @@ _dor_diagnose_tasks() {
 			return 1
 		}
 	done
-	declare -F find_stuck_oom_processes >/dev/null 2>&1 || {
-		printf 'Error: find_stuck_oom_processes not defined.\n' >&2
+	declare -F scan_oom_processes >/dev/null 2>&1 || {
+		printf 'Error: scan_oom_processes not defined.\n' >&2
 		return 1
 	}
 
@@ -609,7 +631,7 @@ _dor_diagnose_tasks() {
 	local stuck_list="" instance out
 	while IFS= read -r instance <&3; do
 		[ -z "$instance" ] && continue
-		printf '\n==> [%s] find_stuck_oom_processes "%s"\n' "$instance" "$pattern"
+		printf '\n==> [%s] scan_oom_processes "%s"\n' "$instance" "$pattern"
 		printf '    tasks on this instance:\n'
 		awk -F'\t' -v i="$instance" '$1==i{sub(/^[^\t]*\t/,""); print "      - " $0}' "$mapf"
 
@@ -892,10 +914,10 @@ Usage:
   x.sh <command> [args...]
 
 Commands:
-  aws_ssh_job_instance <job_id>
+  open_task_shell <job_id>
       Trace a Batch job to its EC2 instance and open an SSM session.
 
-  find_stuck_oom_processes [--all|-a] [--match|-m TAG] PATTERN
+  scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN
       On-host check for processes stuck after child OOM kills.
 
   diagnose_oom_run ...
@@ -904,15 +926,24 @@ Commands:
   find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
       Find which workflow/run owns a task with the given tag.
 
-  star_progress --fastq FILE --progress-file FILE [--sample-reads N]
+  show_star_progress --fastq FILE --progress-file FILE [--sample-reads N]
       Estimate STAR alignment progress and ETA from its Log.progress.out.
+
+  show_task_star_progress --workflow-id <id> --native-id <nativeId>
+      Resolve a task's workdir + container image, trace it to its EC2
+      instance, then docker exec into the task container and run
+      show_star_progress on the task's barcode_head FASTQ + progress file.
 
   help
       Show this help message.
 
-Compatibility aliases:
-  aws-ssh-job-instance, find-stuck-oom-processes, diagnose-oom-run,
-  find-run-by-task-tag, star-progress
+Compatibility aliases (all still accepted):
+  Dash-case spelling of every command (e.g. show-star-progress), plus the
+  pre-rename legacy names:
+    aws_ssh_job_instance      -> open_task_shell
+    find_stuck_oom_processes  -> scan_oom_processes
+    star_progress             -> show_star_progress
+    star_progress_task        -> show_task_star_progress
 EOF
 }
 
@@ -924,13 +955,13 @@ _xsh_main() {
 		_xsh_usage
 		[ -z "$entrypoint" ] && return 2 || return 0
 		;;
-	aws_ssh_job_instance | aws-ssh-job-instance)
+	open_task_shell | open-task-shell | aws_ssh_job_instance | aws-ssh-job-instance)
 		shift
-		aws_ssh_job_instance "$@"
+		open_task_shell "$@"
 		;;
-	find_stuck_oom_processes | find-stuck-oom-processes)
+	scan_oom_processes | scan-oom-processes | find_stuck_oom_processes | find-stuck-oom-processes)
 		shift
-		find_stuck_oom_processes "$@"
+		scan_oom_processes "$@"
 		;;
 	diagnose_oom_run | diagnose-oom-run)
 		shift
@@ -940,9 +971,13 @@ _xsh_main() {
 		shift
 		find_run_by_task_tag "$@"
 		;;
-	star_progress | star-progress)
+	show_star_progress | show-star-progress | star_progress | star-progress)
 		shift
-		star_progress "$@"
+		show_star_progress "$@"
+		;;
+	show_task_star_progress | show-task-star-progress | star_progress_task | star-progress-task)
+		shift
+		show_task_star_progress "$@"
 		;;
 	*)
 		printf 'x.sh: unknown command: %s\n\n' "$entrypoint" >&2
@@ -964,14 +999,14 @@ _xsh_main() {
 # complete, reads remaining, and an ETA.
 #
 # Usage:
-#   star_progress --fastq FILE --progress-file FILE [--sample-reads N]
+#   show_star_progress --fastq FILE --progress-file FILE [--sample-reads N]
 #     --fastq FILE          Input FASTQ fed to STAR (sampled for size estimation)
 #     --progress-file FILE  STAR Log.progress.out to read the latest counters from
 #     --sample-reads N      Reads to sample for the bytes/read estimate (default 100000)
 #
 # Note: uses `stat -c` (GNU/Linux); intended to run on the compute host.
 # =============================================================================
-star_progress() {
+show_star_progress() {
 	local fastq=""
 	local progress_file=""
 	local sample_reads=100000
@@ -979,7 +1014,7 @@ star_progress() {
 	usage() {
 		cat <<EOF
 Usage:
-  star_progress --fastq FILE --progress-file FILE [OPTIONS]
+  show_star_progress --fastq FILE --progress-file FILE [OPTIONS]
 
 Required:
   --fastq FILE            Input FASTQ file
@@ -992,11 +1027,11 @@ Optional:
   -h, --help              Show this help message
 
 Examples:
-  star_progress \
+  show_star_progress \
     --fastq barcode_head.fastq \
     --progress-file barcode_headLog.progress.out
 
-  star_progress \
+  show_star_progress \
     --fastq barcode_head.fastq \
     --progress-file barcode_headLog.progress.out \
     --sample-reads 500000
@@ -1093,10 +1128,255 @@ EOF
     }'
 }
 
+# =============================================================================
+# Public: run show_star_progress for a task identified by workflow + nativeId
+# -----------------------------------------------------------------------------
+# Ties the pieces together so you never assemble the FASTQ / progress-file paths
+# by hand. Given a workflow ID and a task's nativeId (AWS Batch job UUID) it:
+#   1. resolves the task's work directory AND container image via the Tower API
+#      (same backend `tw` talks to; reuses this toolbox's API_* env so no
+#      separate TOWER_* setup),
+#   2. traces the nativeId to its backing EC2 instance (_aws_batch_job_to_ec2),
+#   3. on that host, finds the running task container by its image tag
+#      (sudo docker ps | grep <tag>), then `docker exec`s into it and there
+#      converts the s3:// workdir to its /fusion/s3 mount, locates the *_ALIGN
+#      output directory, and runs show_star_progress on the fixed process/barcode_head
+#      FASTQ + Log.progress.out paths.
+#
+# Usage:
+#   show_task_star_progress --workflow-id <id> --native-id <nativeId>
+#
+# Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
+# Requirements: aws (SSM), curl, jq.
+# =============================================================================
+
+# --- API: resolve a task's workdir + container image by nativeId -------------
+# Emits "<workdir>\t<container-image>" on stdout; errors on stderr. Reuses the
+# same paginated /workflow/<id>/tasks endpoint as _dor_list_running_tasks.
+_sp_task_info() {
+	local wf="$1" nid="$2"
+	_dor_preflight curl jq || return 1
+
+	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
+	local ep="${API_ENDPOINT%/}"
+	local offset=0 total page row
+
+	while :; do
+		page="$(curl -fsSL --get "${auth[@]}" \
+			--data-urlencode "max=100" \
+			--data-urlencode "offset=$offset" \
+			--data-urlencode "workspaceId=$WORKSPACE_ID" \
+			"$ep/workflow/$wf/tasks")" || {
+			printf 'show_task_star_progress: API request failed at offset %s for workflow %s\n' "$offset" "$wf" >&2
+			return 1
+		}
+
+		total="$(jq -r '.total // 0' <<<"$page")"
+		row="$(jq -r --arg n "$nid" '
+			.tasks[] | (.task // .)
+			| select((.nativeId | tostring) == $n)
+			| "\(.workdir // "")\t\(.container // "")"' <<<"$page" | head -1)"
+		[ -n "${row%%$'\t'*}" ] && {
+			printf '%s\n' "$row"
+			return 0
+		}
+
+		offset=$((offset + 100))
+		[ "$offset" -ge "$total" ] && break
+	done
+
+	printf 'show_task_star_progress: no task with nativeId %s found in workflow %s\n' "$nid" "$wf" >&2
+	return 1
+}
+
+# --- container driver: shipped INTO the task container and run there ---------
+# Converts the task's s3:// workdir to its /fusion/s3 mount, finds the single
+# *_ALIGN output directory under it, and invokes show_star_progress on the fixed
+# barcode_head FASTQ + Log.progress.out paths. Runs inside the container so it
+# sees the same fusion mount and GNU coreutils the task itself used.
+#   $1 = s3:// work directory of the task
+_sp_container_driver() {
+	local workdir="$1"
+	local fusion="/fusion/s3/${workdir#s3://}"
+
+	local align_dir
+	align_dir="$(ls -d "$fusion"/*_ALIGN 2>/dev/null | head -1)"
+	if [ -z "$align_dir" ]; then
+		echo "No *_ALIGN directory found under $fusion" >&2
+		return 1
+	fi
+
+	echo "Work directory  : $fusion"
+	echo "ALIGN directory : $align_dir"
+	echo
+	show_star_progress \
+		--fastq "$align_dir/process/barcode_head.fastq" \
+		--progress-file "$align_dir/process/barcode_headLog.progress.out"
+}
+
+# --- ship + run: locate the container on the host, exec show_star_progress in it --
+# Builds two layers and ships the outer one to the EC2 instance via SSM:
+#   inner (runs in the container): show_star_progress + _sp_container_driver, base64
+#     encoded so it survives the docker-exec stdin pipe without quoting hazards.
+#   outer (runs on the host):      find the container by image tag, decode the
+#     inner script, and pipe it into `sudo docker exec -i <cid> bash -s`.
+#   $1 = EC2 instance id   $2 = container image ref   $3 = s3:// work directory
+_sp_run_remote() {
+	local instance="$1" image="$2" workdir="$3"
+	local tag="${image##*:}"
+	local inner_src inner_script b64 host_script
+
+	inner_src="$(declare -f show_star_progress _sp_container_driver)" || return 1
+	inner_script="set -u
+${inner_src}
+_sp_container_driver $(printf '%q' "$workdir")"
+	b64="$(printf '%s' "$inner_script" | base64 | tr -d '\n')"
+
+	# Local interpolation injects the image/tag/payload as quoted literals; every
+	# remote-evaluated $ is escaped (\$) so it survives into the host script.
+	host_script="set -u
+image=$(printf '%q' "$image")
+tag=$(printf '%q' "$tag")
+b64=$(printf '%q' "$b64")
+cid=\$(sudo docker ps --no-trunc | grep -F -- \"\$tag\" | awk '{print \$1}' | head -1)
+if [ -z \"\$cid\" ]; then
+	echo \"No running container found for image \$image (searched docker ps for tag \$tag)\" >&2
+	exit 1
+fi
+echo \"Container image : \$image\"
+echo \"Container id    : \$cid\"
+echo
+printf '%s' \"\$b64\" | base64 -d | sudo docker exec -i \"\$cid\" bash -s"
+
+	_xsh_ssm_run "$instance" "$host_script" "show_star_progress $tag"
+}
+
+# --- public orchestrator -----------------------------------------------------
+show_task_star_progress() {
+	local usage
+	read -r -d '' usage <<'EOF' || true
+Usage: show_task_star_progress --workflow-id <id> --native-id <nativeId>
+
+Resolve a STAR alignment task's work directory and container image via the
+Tower API, trace its nativeId to the backing EC2 instance, find the running task
+container there, and run show_star_progress inside it against the task's barcode_head
+FASTQ and Log.progress.out.
+
+Options:
+  --workflow-id <id>   Tower workflow ID that owns the task.
+  --native-id <id>     Task nativeId (AWS Batch job UUID).
+  -h, --help           Show this help message and exit.
+
+Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
+Requirements: aws (SSM), curl, jq.
+
+Example:
+  show_task_star_progress \
+    --workflow-id 2xAbCdEfGhIjKl \
+    --native-id aa00a1e2-1e96-4cbb-a670-3b33c5ac356d
+EOF
+
+	local wf="" nid=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--workflow-id)
+			[ $# -ge 2 ] || {
+				printf 'show_task_star_progress: --workflow-id requires a value\n' >&2
+				return 2
+			}
+			wf="$2"
+			shift 2
+			;;
+		--workflow-id=*)
+			wf="${1#*=}"
+			shift
+			;;
+		--native-id)
+			[ $# -ge 2 ] || {
+				printf 'show_task_star_progress: --native-id requires a value\n' >&2
+				return 2
+			}
+			nid="$2"
+			shift 2
+			;;
+		--native-id=*)
+			nid="${1#*=}"
+			shift
+			;;
+		-h | --help)
+			printf '%s\n' "$usage"
+			return 0
+			;;
+		-*)
+			printf 'Error: unknown option %s\n\n' "$1" >&2
+			printf '%s\n' "$usage" >&2
+			return 1
+			;;
+		*)
+			printf 'Error: unexpected argument %s\n\n' "$1" >&2
+			printf '%s\n' "$usage" >&2
+			return 1
+			;;
+		esac
+	done
+
+	[ -z "$wf" ] && {
+		printf 'Error: missing required option --workflow-id.\n\n' >&2
+		printf '%s\n' "$usage" >&2
+		return 1
+	}
+	[ -z "$nid" ] && {
+		printf 'Error: missing required option --native-id.\n\n' >&2
+		printf '%s\n' "$usage" >&2
+		return 1
+	}
+	command -v aws >/dev/null 2>&1 || {
+		printf 'show_task_star_progress: required command not found: aws\n' >&2
+		return 1
+	}
+
+	printf '==> Resolving work directory + container image for task %s in workflow %s...\n' "$nid" "$wf" >&2
+	local info workdir image
+	info="$(_sp_task_info "$wf" "$nid")" || return 1
+	workdir="${info%%$'\t'*}"
+	image="${info#*$'\t'}"
+	if [ -z "$workdir" ] || [ -z "$image" ]; then
+		printf 'show_task_star_progress: task %s is missing a workdir or container image (got workdir=%q image=%q).\n' \
+			"$nid" "$workdir" "$image" >&2
+		return 1
+	fi
+	printf '    workdir: %s\n' "$workdir" >&2
+	printf '    image  : %s\n' "$image" >&2
+
+	printf '==> Tracing nativeId %s to its EC2 instance...\n' "$nid" >&2
+	local ec2
+	ec2="$(_aws_batch_job_to_ec2 "$nid")" || {
+		printf 'show_task_star_progress: could not trace nativeId %s to an EC2 instance.\n' "$nid" >&2
+		return 1
+	}
+	printf '    EC2 instance: %s\n' "$ec2" >&2
+
+	printf '==> Running show_star_progress inside the task container on %s...\n' "$ec2" >&2
+	_sp_run_remote "$ec2" "$image" "$workdir"
+}
+
 # Source-compatible wrapper for existing users.
 diagnose_oom_run() {
 	_dor_main "$@"
 }
+
+# =============================================================================
+# Backward-compatible aliases for the pre-rename public names.
+# -----------------------------------------------------------------------------
+# These forward to the current verb-first names so anything sourced before the
+# rename (interactive shells, scripts, muscle memory) keeps working. The real
+# implementations -- and the ones shipped to remote hosts via `declare -f` --
+# are the new names; these are thin local pass-throughs only.
+# =============================================================================
+aws_ssh_job_instance() { open_task_shell "$@"; }
+find_stuck_oom_processes() { scan_oom_processes "$@"; }
+star_progress() { show_star_progress "$@"; }
+star_progress_task() { show_task_star_progress "$@"; }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	_xsh_main "$@"
