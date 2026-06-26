@@ -111,6 +111,15 @@ _xsh_ssm_run() {
 	out="$(aws ssm get-command-invocation --command-id "$cmd_id" \
 		--instance-id "$instance" --query 'StandardOutputContent' --output text 2>/dev/null </dev/null)"
 	printf '%s\n' "$out"
+	# Surface the remote script's stderr too -- otherwise failures inside the
+	# command (e.g. "FASTQ not found") vanish and the caller just sees output
+	# stop with no explanation.
+	local err
+	err="$(aws ssm get-command-invocation --command-id "$cmd_id" \
+		--instance-id "$instance" --query 'StandardErrorContent' --output text 2>/dev/null </dev/null)"
+	if [ -n "$err" ] && [ "$err" != "None" ]; then
+		printf '%s\n' "$err" >&2
+	fi
 	[ "$inv_status" = "Success" ]
 }
 
@@ -996,6 +1005,43 @@ _xsh_main() {
 }
 
 # =============================================================================
+# Internal: find a running STAR process aligning a given FASTQ
+# -----------------------------------------------------------------------------
+# Walks /proc/<pid>/cmdline (NUL-separated args, joined with spaces) and prints
+# "<pid>  <cmdline>" for every process whose command contains both "STAR" and
+# the FASTQ's basename. Uses /proc directly so it needs no pgrep/procps flags,
+# which matters because this is shipped into the task container. Returns 0 if at
+# least one match was found, 1 otherwise.
+#   $1 = FASTQ path STAR is expected to be reading
+# =============================================================================
+_sp_star_running() {
+	local fastq="$1" base cmdfile pid cmd found=1
+	base="${fastq##*/}"
+	[ -d /proc ] || return 1
+	# Let `find` do the /proc/<pid> matching so this never trips a shell's
+	# no-match glob behaviour (zsh aborts on it); robust whether sourced into
+	# bash or zsh, or shipped into the container's `bash -s`.
+	while IFS= read -r cmdfile; do
+		[ -r "$cmdfile" ] || continue
+		cmd="$(tr '\0' ' ' <"$cmdfile" 2>/dev/null)"
+		case "$cmd" in
+		*STAR*) ;;
+		*) continue ;;
+		esac
+		case "$cmd" in
+		*"$base"*)
+			pid="${cmdfile#/proc/}"
+			printf '%s  %s\n' "${pid%/cmdline}" "$cmd"
+			found=0
+			;;
+		esac
+	done <<EOF
+$(find /proc -maxdepth 2 -regex '/proc/[0-9]+/cmdline' 2>/dev/null)
+EOF
+	return $found
+}
+
+# =============================================================================
 # Public: estimate STAR alignment progress and ETA
 # -----------------------------------------------------------------------------
 # STAR writes a running counter to its Log.progress.out, but reports neither a
@@ -1083,6 +1129,21 @@ EOF
 		usage >&2
 		return 1
 	}
+
+	# Guard FIRST: only report progress if STAR is actually aligning this FASTQ.
+	# This runs before the file-existence checks because STAR liveness is the
+	# real precondition -- if STAR isn't running, the FASTQ/progress paths being
+	# present or absent is irrelevant and the numbers would be stale anyway. The
+	# check reads /proc, not the files, so it works even if the FASTQ is a pipe
+	# or has since been removed.
+	local star_procs
+	star_procs="$(_sp_star_running "$fastq")"
+	if [[ -z "$star_procs" ]]; then
+		echo "No running STAR process is aligning ${fastq##*/}." >&2
+		echo "(STAR may have finished or not yet started; progress numbers would be stale.)" >&2
+		return 1
+	fi
+	echo "STAR process    : $(printf '%s' "$star_procs" | head -1 | awk '{print $1}') (running)"
 
 	[[ ! -f "$fastq" ]] && {
 		echo "FASTQ not found: $fastq" >&2
@@ -1233,7 +1294,7 @@ _sp_run_remote() {
 	local tag="${image##*:}"
 	local inner_src inner_script b64 host_script
 
-	inner_src="$(declare -f show_star_progress _sp_container_driver)" || return 1
+	inner_src="$(declare -f show_star_progress _sp_star_running _sp_container_driver)" || return 1
 	inner_script="set -u
 ${inner_src}
 _sp_container_driver $(printf '%q' "$workdir")"
