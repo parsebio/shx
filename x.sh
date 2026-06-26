@@ -1286,12 +1286,14 @@ _sp_container_driver() {
 # Builds two layers and ships the outer one to the EC2 instance via SSM:
 #   inner (runs in the container): show_star_progress + _sp_container_driver, base64
 #     encoded so it survives the docker-exec stdin pipe without quoting hazards.
-#   outer (runs on the host):      find the container by image tag, decode the
-#     inner script, and pipe it into `sudo docker exec -i <cid> bash -s`.
+#   outer (runs on the host):      find THIS task's container (by the work dir
+#     embedded in the container's launch config, falling back to image tag),
+#     decode the inner script, and pipe it into `sudo docker exec -i <cid> bash -s`.
 #   $1 = EC2 instance id   $2 = container image ref   $3 = s3:// work directory
 _sp_run_remote() {
 	local instance="$1" image="$2" workdir="$3"
 	local tag="${image##*:}"
+	local fusion="/fusion/s3/${workdir#s3://}"
 	local inner_src inner_script b64 host_script
 
 	inner_src="$(declare -f show_star_progress _sp_star_running _sp_container_driver)" || return 1
@@ -1305,10 +1307,33 @@ _sp_container_driver $(printf '%q' "$workdir")"
 	host_script="set -u
 image=$(printf '%q' "$image")
 tag=$(printf '%q' "$tag")
+fusion=$(printf '%q' "$fusion")
 b64=$(printf '%q' "$b64")
-cid=\$(sudo docker ps --no-trunc | grep -F -- \"\$tag\" | awk '{print \$1}' | head -1)
+
+# Pick the container running THIS task, not just any container sharing the
+# image tag. The image tag is NOT unique per task -- a host commonly runs
+# several containers of the same image, so 'grep tag | head -1' can land in a
+# different task's container (where this task's STAR is invisible, since each
+# container has its own PID namespace). Every Nextflow/fusion task container is
+# launched to run <workdir>/.command.run, so the task's unique work directory is
+# embedded in the container's immutable launch config: inspect each running
+# container and match on it. This is exact and independent of process/clock
+# state (unlike matching container start time to the task's execution time,
+# which breaks when a container outlives or predates the task).
+cid=\"\"
+for c in \$(sudo docker ps --no-trunc --format '{{.ID}}'); do
+	if sudo docker inspect \"\$c\" 2>/dev/null | grep -qF -- \"\$fusion\"; then
+		cid=\$c
+		break
+	fi
+done
 if [ -z \"\$cid\" ]; then
-	echo \"No running container found for image \$image (searched docker ps for tag \$tag)\" >&2
+	# Fallback: first running container matching the image tag (old behaviour).
+	cid=\$(sudo docker ps --no-trunc | grep -F -- \"\$tag\" | awk '{print \$1}' | head -1)
+	[ -n \"\$cid\" ] && echo \"WARN: no container config referenced \$fusion; falling back to first \$tag container (\$cid). It may belong to a different task.\" >&2
+fi
+if [ -z \"\$cid\" ]; then
+	echo \"No running container found for image \$image (searched by work dir and tag \$tag)\" >&2
 	exit 1
 fi
 echo \"Container image : \$image\"
