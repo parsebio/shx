@@ -9,7 +9,8 @@
 #   _xsh_main
 #
 # Source-compatible function names remain available:
-#   open_task_shell, scan_oom_processes, diagnose_oom_run
+#   open_task_shell, scan_oom_processes, scan_stall_processes,
+#   diagnose_run (umbrella; diagnose_stall_run / diagnose_oom_run pin one probe)
 #
 # No code is duplicated: the Batch->ECS->EC2 trace lives once in
 # _aws_batch_job_to_ec2 (used by both open_task_shell and the diagnoser),
@@ -197,6 +198,35 @@ EOF
 }
 
 # =============================================================================
+# Shared: read OOM / memory evidence for a pid's cgroup (cause attribution)
+# -----------------------------------------------------------------------------
+# The single source of truth for "did this cgroup get OOM-killed, and what are
+# its memory limits". Used both by scan_oom_processes (its whole purpose) and by
+# scan_stall_processes (to attribute a stall to OOM). Shipped alongside whichever
+# probe needs it via `declare -f`, so it must stay self-contained.
+#
+# Emits one TSV line: cgroup <TAB> oom_kill <TAB> oom_group <TAB> mem_max <TAB>
+# mem_current <TAB> events   (events is last; it is the only field with spaces).
+# Tunable (env): CGROUP_ROOT (default /sys/fs/cgroup). cgroup v2 only.
+#   $1 = pid
+# =============================================================================
+_oom_evidence() {
+	local pid="$1" root="${CGROUP_ROOT:-/sys/fs/cgroup}"
+	local cg base oom_group mem_max mem_cur events oom_kill
+	# cgroup v2: the unified hierarchy line starts with "0::"
+	cg=$(awk -F: '/^0::/{print $3}' "/proc/$pid/cgroup" 2>/dev/null)
+	base="${root}${cg}"
+	oom_group=$(cat "$base/memory.oom.group" 2>/dev/null)
+	mem_max=$(cat "$base/memory.max" 2>/dev/null)
+	mem_cur=$(cat "$base/memory.current" 2>/dev/null)
+	events=$(cat "$base/memory.events" 2>/dev/null | tr '\n' ' ')
+	oom_kill=$(printf '%s' "$events" | awk '{for(i=1;i<NF;i++) if($i=="oom_kill") print $(i+1)}')
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"${cg:-}" "${oom_kill:-0}" "${oom_group:-<n/a>}" \
+		"${mem_max:-<n/a>}" "${mem_cur:-<n/a>}" "${events:-<n/a>}"
+}
+
+# =============================================================================
 # Public: on-host OOM-stuck process finder (run this ON the host)
 # -----------------------------------------------------------------------------
 # Find processes that are hung because the kernel OOM-killed some of their
@@ -213,7 +243,6 @@ EOF
 # Tunables (env): CGROUP_ROOT (default /sys/fs/cgroup), PROC_PATTERN.
 # =============================================================================
 scan_oom_processes() {
-	local cgroup_root="${CGROUP_ROOT:-/sys/fs/cgroup}"
 
 	# Default: show only STUCK matches. --all/-a shows every one.
 	# --match/-m TAG restricts to matches whose cmdline contains TAG.
@@ -268,11 +297,8 @@ scan_oom_processes() {
 		return 2
 	fi
 
-	local read_file
-	read_file() { cat "$1" 2>/dev/null; }
-
 	local stuck_pids=()
-	local pids pid cg base oom_group mem_max mem_cur mem_events zombies oom_kill
+	local pids pid cg oom_group mem_max mem_cur mem_events zombies oom_kill ev
 	local block is_stuck cmdline matched=0
 
 	pids=$(pgrep -f "$proc_pattern" 2>/dev/null)
@@ -294,21 +320,13 @@ scan_oom_processes() {
 		fi
 		matched=1
 
-		# cgroup v2: the unified hierarchy line starts with "0::"
-		cg=$(awk -F: '/^0::/{print $3}' "/proc/$pid/cgroup" 2>/dev/null)
-
-		base="${cgroup_root}${cg}"
-		oom_group=$(read_file "$base/memory.oom.group")
-		mem_max=$(read_file "$base/memory.max")
-		mem_cur=$(read_file "$base/memory.current")
-		mem_events=$(read_file "$base/memory.events" | tr '\n' ' ')
+		# cgroup OOM / memory facts (shared with scan_stall_processes).
+		ev=$(_oom_evidence "$pid")
+		IFS=$'\t' read -r cg oom_kill oom_group mem_max mem_cur mem_events <<<"$ev"
+		oom_kill=${oom_kill:-0}
 
 		# Count zombie/defunct direct children the parent can never reap.
 		zombies=$(ps --ppid "$pid" -o stat= 2>/dev/null | grep -c '^Z')
-
-		# Pull the oom_kill counter out of memory.events for the verdict.
-		oom_kill=$(printf '%s' "$mem_events" | awk '{for(i=1;i<NF;i++) if($i=="oom_kill") print $(i+1)}')
-		oom_kill=${oom_kill:-0}
 
 		# Build the per-process report block (so we can choose whether to print it).
 		is_stuck=0
@@ -356,7 +374,251 @@ scan_oom_processes() {
 }
 
 # =============================================================================
-# diagnose_oom_run internals (namespaced _dor_)
+# Public: detect a STALLED split-pipe PRE job, and attribute the cause (on host)
+# -----------------------------------------------------------------------------
+# This is the SYMPTOM-first probe: it answers "is this job making forward
+# progress?" regardless of why it stopped, then -- when it is NOT -- tries to
+# name the cause (OOM today, via the shared _oom_evidence). That is the natural
+# debugging order: notice the stall, then ask why. scan_oom_processes is the
+# cause-first counterpart (it only fires when it finds OOM evidence); this one
+# has no such blind spot -- a stall from a segfault or a deadlock is flagged
+# just the same, and simply reported as "not OOM".
+#
+# The companion long sampler (pre_progress_check.sh) needs a 30-60 min window to
+# tell PINNED from GLACIAL throughput. That window is NOT needed to answer "is it
+# stalled?": that follows from near-instantaneous signals plus a short churn
+# sample, so this finishes in under a minute and is safe to ship over SSM.
+#
+#   * dispatcher kernel wait-channel (/proc/<pid>/wchan) -> parked in wait()/join?
+#   * worker process state (/proc/<pid>/stat)            -> zombie? running? D-wait?
+#   * a short double-sample                              -> is the pool CHURNING
+#                                                           (workers reaped/spawned)?
+#   * cgroup memory.events (via _oom_evidence)           -> was the cause OOM?
+#
+# Verdicts:
+#   WORKING       live worker(s) reading / in D / running / burning CPU -> fine.
+#   CRASH-LOOP?   pool churns but no worker did ANY I/O -> between-batch gap OR a
+#                 crash-restart loop; disambiguate by output growth (FLAGGED).
+#   HUNG          zombies unreaped while the dispatcher is parked in a wait/pipe
+#                 channel and does no I/O -> wedged; will not recover (FLAGGED).
+#   DEGRADED      some (not all) workers zombie -> heading toward a hang (FLAGGED).
+#   IDLE/STALLED  nothing reading/writing/zombie/churning -> between phases; recheck.
+#
+# Each FLAGGED verdict carries a cause line: OOM (with the oom_kill count and
+# memory limits) when the cgroup shows it, otherwise a pointer to dmesg/logs.
+# Ships via `declare -f scan_stall_processes _oom_evidence`. Lines starting
+# ">>> FLAG" mark an instance needing attention.
+#
+# Usage: scan_stall_processes [--window SECONDS] [--all] [PATTERN]
+#   PATTERN defaults to 'split-pipe --mode pre'; --window defaults to 20s.
+# =============================================================================
+scan_stall_processes() {
+	local window=20 show_all=0 pattern=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-w | --window)
+			[ -n "${2:-}" ] || {
+				echo "scan_stall_processes: --window needs a value" >&2
+				return 2
+			}
+			window="$2"
+			shift 2
+			;;
+		--window=*)
+			window="${1#*=}"
+			shift
+			;;
+		-a | --all)
+			show_all=1
+			shift
+			;;
+		-h | --help)
+			echo "Usage: scan_stall_processes [--window SECONDS] [--all] [PATTERN]"
+			echo "  Fast STALL detector + cause attribution (default window 20s,"
+			echo "  default pattern 'split-pipe --mode pre')."
+			return 0
+			;;
+		-*)
+			echo "scan_stall_processes: unknown option $1" >&2
+			return 2
+			;;
+		*)
+			pattern="$1"
+			shift
+			;;
+		esac
+	done
+	[ -n "$pattern" ] || pattern="split-pipe --mode pre"
+	case "$window" in
+	'' | *[!0-9]*)
+		echo "scan_stall_processes: --window must be an integer" >&2
+		return 2
+		;;
+	esac
+
+	# recursive descendant walker (a dispatcher's children are its workers)
+	_ssp_desc() {
+		local r=$1 k
+		for k in $(pgrep -P "$r" 2>/dev/null); do
+			echo "$k"
+			_ssp_desc "$k"
+		done
+	}
+
+	# one process row: "pid<TAB>role<TAB>state<TAB>cpu_ticks<TAB>rchar<TAB>wchan".
+	# Emits nothing if the pid is gone (fully reaped) -- absence is the signal.
+	_ssp_row() {
+		local p=$1 role=$2 raw rest state cpu rchar wch
+		raw=$(cat "/proc/$p/stat" 2>/dev/null) || return 0
+		[ -z "$raw" ] && return 0
+		rest=${raw#*") "} # strip "pid (comm) "
+		set -- $rest      # $1=state ... $12=utime $13=stime
+		state=$1
+		cpu=$((${12:-0} + ${13:-0}))
+		rchar=$(awk '/^rchar/{print $2; exit}' "/proc/$p/io" 2>/dev/null)
+		rchar=${rchar:-0}
+		wch=$(cat "/proc/$p/wchan" 2>/dev/null)
+		wch=${wch:-0}
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$role" "$state" "$cpu" "$rchar" "$wch"
+	}
+
+	# one snapshot of the whole tree. Re-discovers dispatchers AND workers each
+	# call, so a respawned dispatcher PID or freshly spawned worker is captured.
+	_ssp_snap() {
+		local disp d c cmd
+		disp=$(pgrep -f "$pattern" 2>/dev/null)
+		[ -z "$disp" ] && return 0
+		for d in $disp; do _ssp_row "$d" dispatcher; done
+		for d in $disp; do
+			for c in $(_ssp_desc "$d"); do
+				case " $disp " in *" $c "*) continue ;; esac # nested dispatcher: skip
+				cmd=$( { tr '\0' ' ' <"/proc/$c/cmdline"; } 2>/dev/null)
+				case "$cmd" in *mem_loop*) continue ;; esac # memory profiler, not a worker
+				_ssp_row "$c" worker
+			done
+		done
+	}
+
+	local disp_list
+	disp_list=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+	disp_list=${disp_list% }
+	if [ -z "$disp_list" ]; then
+		echo "No processes match: $pattern"
+		return 0
+	fi
+
+	local f1 f2
+	f1=$(mktemp)
+	f2=$(mktemp)
+	_ssp_snap >"$f1"
+	echo "Dispatcher(s): $disp_list   |   sampling ${window}s for churn ..."
+	sleep "$window"
+	_ssp_snap >"$f2"
+
+	# Cause attribution: read the dispatcher cgroup's OOM evidence (workers share
+	# it). The verdict is the symptom; this names WHY when it can. Take the max
+	# oom_kill across dispatchers, with that cgroup's memory limits.
+	local oomkill=0 oommax="<n/a>" oomcur="<n/a>" d ev k om oc
+	for d in $disp_list; do
+		ev=$(_oom_evidence "$d")
+		k=$(printf '%s' "$ev" | cut -f2)
+		om=$(printf '%s' "$ev" | cut -f4)
+		oc=$(printf '%s' "$ev" | cut -f5)
+		if [ "${k:-0}" -gt "${oomkill:-0}" ] 2>/dev/null; then
+			oomkill=$k
+			oommax=$om
+			oomcur=$oc
+		fi
+	done
+
+	awk -F'\t' -v SHOWALL="$show_all" -v DISPLIST="$disp_list" \
+		-v OOMKILL="$oomkill" -v OOMMAX="$oommax" -v OOMCUR="$oomcur" '
+	FNR==NR { role1[$1]=$2; s1[$1]=$3; c1[$1]=$4; rc1[$1]=$5; w1[$1]=$6; in1[$1]=1; next }
+	{ role2[$1]=$2; s2[$1]=$3; c2[$1]=$4; rc2[$1]=$5; w2[$1]=$6; in2[$1]=1 }
+	END {
+		printf "\n%-9s %-10s %-6s %12s %12s  %s\n", "PID","ROLE","STATE","dcpu_ticks","drchar","WCHAN"
+		for (p in in2) allp[p]=1
+		for (p in in1) allp[p]=1
+		for (pass=0; pass<2; pass++) {
+			for (p in allp) {
+				role=(p in in2)?role2[p]:role1[p]
+				if (pass==0 && role!="dispatcher") continue
+				if (pass==1 && role=="dispatcher") continue
+				st=(p in in2)?s2[p]:"GONE"
+				dc=((p in in1)&&(p in in2))?(c2[p]-c1[p]):0
+				dr=((p in in1)&&(p in in2))?(rc2[p]-rc1[p]):0
+				wc=(p in in2)?w2[p]:w1[p]
+				printf "%-9s %-10s %-6s %12s %12s  %s\n", p, role, st, dc, dr, wc
+			}
+		}
+		nlive=0; zomb=0; pzomb=0; dwait=0; running=0; worksig=0; reaped=0; appeared=0
+		for (p in in2) {
+			if (role2[p]!="worker") continue
+			nlive++
+			if (s2[p]=="Z") zomb++
+			if (s2[p]=="D") { dwait++; worksig=1 }
+			if (s2[p]=="R") { running++; worksig=1 }
+			if ((p in in1) && s1[p]=="Z" && s2[p]=="Z") pzomb++
+			if ((p in in1) && (c2[p]+0)>(c1[p]+0)) worksig=1
+			if ((p in in1) && (rc2[p]+0)>(rc1[p]+0)) worksig=1
+			if (!(p in in1)) appeared++
+		}
+		for (p in in1) { if (role1[p]=="worker" && !(p in in2)) reaped++ }
+		churn=(reaped>0 || appeared>0)?1:0
+		dbusy=0; dwaitall=1
+		for (p in in2) {
+			if (role2[p]!="dispatcher") continue
+			if ((p in in1) && ((c2[p]+0)>(c1[p]+0) || (rc2[p]+0)>(rc1[p]+0))) dbusy=1
+			# blocked waiting on IPC: classic wedge channels (do_wait, pipe_read, ...)
+			if (w2[p] !~ /wait|pipe_read/) dwaitall=0
+		}
+		# cause line, printed under every FLAGGED verdict
+		if (OOMKILL+0 > 0)
+			cause = sprintf("  Likely cause: OOM -- cgroup memory.events oom_kill=%s (memory.max=%s, memory.current=%s).\n  -> fix: raise the PRE-stage memory or shrink chunk size, not just restart.", OOMKILL, OOMMAX, OOMCUR)
+		else
+			cause = "  Cause: not OOM (oom_kill=0). Check `dmesg` for a segfault and the task log for a\n  Python traceback -- the worker(s) died some other way."
+
+		printf "\nworkers: %d live (%d zombie, %d persistent-zombie, %d running, %d disk-wait) | reaped %d, spawned %d | dispatcher busy=%d wait=%d | oom_kill=%s\n", \
+			nlive, zomb, pzomb, running, dwait, reaped, appeared, dbusy, dwaitall, OOMKILL
+
+		print  "================================ VERDICT ================================"
+		if (worksig==1) {
+			print "WORKING: live worker(s) reading / in disk-wait / running / burning CPU."
+			print "  Not hung. (For throughput + ETA, use the long on-host sampler.)"
+		} else if (churn==1) {
+			printf ">>> FLAG: CRASH-LOOP? pool is churning (reaped %d, spawned %d) but NO worker\n", reaped, appeared
+			print  "  showed any I/O or CPU this window. Either a brief between-batch gap OR a"
+			print  "  crash-restart loop spinning with no progress. Disambiguate by output growth"
+			print  "  and whether the SAME zombie PIDs persist while a dispatcher PID changes."
+			print  cause
+		} else if (pzomb>0 && dbusy==0 && dwaitall==1) {
+			printf ">>> FLAG: HUNG. %d zombie worker(s) unreaped across the window while every\n", pzomb
+			print  "  dispatcher is parked in a wait/pipe channel and does no I/O -- wedged"
+			print  "  (e.g. blocked in wait()/join or reading a result pipe from dead workers)."
+			printf "  This will NOT recover; kill the dispatcher(s) [%s] and re-run.\n", DISPLIST
+			print  cause
+		} else if (zomb>0 && zomb==nlive && dbusy==0) {
+			printf ">>> FLAG: HUNG. all %d live worker(s) are zombie and the pool is not recycling\n", nlive
+			printf "  (no reap/spawn). Dispatcher likely wedged; kill [%s] and re-run.\n", DISPLIST
+			print  cause
+		} else if (zomb>0) {
+			printf ">>> FLAG: DEGRADED. %d/%d worker(s) zombie -- some died; watch for a hang.\n", zomb, nlive
+			print  cause
+		} else if (dbusy==1) {
+			print "ACTIVE (parent-side): dispatcher is busy but workers idle -- a single-threaded"
+			print "  parent phase; workers wait. Not hung."
+		} else {
+			print "IDLE/STALLED: no I/O, no zombies, no churn. Possibly between phases -- recheck."
+		}
+		print  "========================================================================="
+	}' "$f1" "$f2"
+
+	rm -f "$f1" "$f2"
+	unset -f _ssp_desc _ssp_row _ssp_snap 2>/dev/null
+}
+
+# =============================================================================
+# diagnose_run internals (namespaced _dor_)
 # =============================================================================
 
 # --- private: fail-fast preflight (env + required commands) ------------------
@@ -381,15 +643,24 @@ _dor_preflight() {
 _dor_usage() {
 	cat >&2 <<'EOF'
 Usage:
-  diagnose_oom_run --run-id <id> [diagnose-args...]       Resolve run -> workflow, diagnose RUNNING tasks
-  diagnose_oom_run --workflow-id <id> [diagnose-args...]  Diagnose a workflow's RUNNING tasks
-  diagnose_oom_run list <workflow-id>                     Print "<nativeId><TAB>label" for RUNNING tasks
-  diagnose_oom_run tasks [-p PATTERN] [--all] [id...]     Diagnose tasks from stdin/args (the back half)
+  diagnose_run --run-id <id> [diagnose-args...]       Resolve run -> workflow, diagnose RUNNING tasks
+  diagnose_run --workflow-id <id> [diagnose-args...]  Diagnose a workflow's RUNNING tasks
+  diagnose_run list <workflow-id>                     Print "<nativeId><TAB>label" for RUNNING tasks
+  diagnose_run tasks [diagnose-args...] [id...]       Diagnose tasks from stdin/args (the back half)
 
-diagnose-args forwarded to the task diagnoser: [-p PATTERN] [--all]
+diagnose-args forwarded to the task diagnoser:
+  -c, --check oom|stall|all    probe(s) to run (default stall):
+                                 stall -> scan_stall_processes (no progress; HUNG /
+                                          crash-loop / degraded, with OOM cause attribution)
+                                 oom   -> scan_oom_processes   (proactive OOM scan:
+                                          child OOM -> stuck parent)
+  -p, --pattern PATTERN        process pattern (oom needs this or PROC_PATTERN;
+                                 stall defaults to 'split-pipe --mode pre')
+  -a, --all                    print every match, not just flagged ones
+
+Aliases: diagnose_stall_run pins --check stall; diagnose_oom_run pins --check oom.
 
 Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
-Diagnosis pattern: pass -p PATTERN, or set PROC_PATTERN.
 EOF
 }
 
@@ -506,24 +777,46 @@ _dor_list_running_tasks() {
 	done
 }
 
-# --- diagnostic: run scan_oom_processes on one instance via SSM --------
+# --- diagnostic: run one PROBE on one instance via SSM -----------------------
+# Ships the chosen on-host probe function (whole, via `declare -f`) and runs it.
+# Both probes also need the shared _oom_evidence helper, so it is shipped too.
+#   $1 = EC2 instance id   $2 = process pattern   $3 = extra flags (e.g. --all)
+#   $4 = probe name: oom (scan_oom_processes) | stall (scan_stall_processes)
 _dor_run_remote() {
-	local instance="$1" pattern="$2" extra="$3"
-	local func_src remote_script
+	local instance="$1" pattern="$2" extra="$3" probe="${4:-oom}"
+	local func_src remote_script call comment
 
-	func_src="$(declare -f scan_oom_processes)" || return 1
+	case "$probe" in
+	stall)
+		# The stall probe has its own sensible default pattern (the PRE
+		# dispatcher), so an empty pattern is fine here.
+		[ -n "$pattern" ] || pattern='split-pipe --mode pre'
+		func_src="$(declare -f scan_stall_processes _oom_evidence)" || return 1
+		call="scan_stall_processes ${extra} $(printf '%q' "$pattern")"
+		comment="scan_stall_processes $pattern"
+		;;
+	oom | *)
+		func_src="$(declare -f scan_oom_processes _oom_evidence)" || return 1
+		call="scan_oom_processes ${extra} $(printf '%q' "$pattern")"
+		comment="scan_oom_processes $pattern"
+		;;
+	esac
+
 	remote_script="set -u
 ${func_src}
-scan_oom_processes ${extra} $(printf '%q' "$pattern")"
+${call}"
 
-	_xsh_ssm_run "$instance" "$remote_script" "scan_oom_processes $pattern"
+	_xsh_ssm_run "$instance" "$remote_script" "$comment"
 }
 
 # --- diagnostic: diagnose a set of tasks -------------------------------------
 # Reads "<nativeId>\t<label>" lines on stdin (or takes native IDs as args),
-# groups by EC2 instance, runs scan_oom_processes on each.
+# groups by EC2 instance, runs the selected probe(s) on each. The default probe
+# is the symptom-first stall check; callers (diagnose_oom_run) override it to oom
+# by exporting _DOR_DEFAULT_CHECK -- a variable rather than a positional arg, so
+# the list/tasks subcommands keep working.
 _dor_diagnose_tasks() {
-	local pattern="${PROC_PATTERN:-}" show_all=""
+	local pattern="${PROC_PATTERN:-}" show_all="" probes="${_DOR_DEFAULT_CHECK:-stall}"
 	local -a native_ids=()
 
 	while [ $# -gt 0 ]; do
@@ -536,14 +829,38 @@ _dor_diagnose_tasks() {
 			pattern="$2"
 			shift 2
 			;;
+		-c | --check)
+			case "${2:-}" in
+			oom | stall) probes="$2" ;;
+			all) probes="oom stall" ;;
+			*)
+				printf 'Error: --check must be oom, stall, or all.\n' >&2
+				return 2
+				;;
+			esac
+			shift 2
+			;;
+		--check=*)
+			case "${1#*=}" in
+			oom | stall) probes="${1#*=}" ;;
+			all) probes="oom stall" ;;
+			*)
+				printf 'Error: --check must be oom, stall, or all.\n' >&2
+				return 2
+				;;
+			esac
+			shift
+			;;
 		-a | --all)
 			show_all="--all"
 			shift
 			;;
 		-h | --help)
-			printf 'Usage: diagnose_oom_run tasks [-p PATTERN] [--all] [nativeId...]\n'
+			printf 'Usage: diagnose_run tasks [-p PATTERN] [-c oom|stall|all] [--all] [nativeId...]\n'
 			printf '  Reads "<nativeId><TAB><label>" lines on stdin if no IDs are given.\n'
-			printf '  PATTERN defaults to PROC_PATTERN when -p/--pattern is not provided.\n'
+			printf '  -c/--check selects the probe(s) (default stall). The oom probe needs a\n'
+			printf '  PATTERN (-p/--pattern or PROC_PATTERN); the stall probe defaults to\n'
+			printf "  'split-pipe --mode pre'.\n"
 			return 0
 			;;
 		-*)
@@ -557,9 +874,15 @@ _dor_diagnose_tasks() {
 		esac
 	done
 
+	# The oom probe needs an explicit pattern; the stall probe supplies its own
+	# default, so a missing pattern is only fatal when oom is among the probes.
 	if [ -z "$pattern" ]; then
-		printf 'Error: no process PATTERN provided (pass -p/--pattern PATTERN or set PROC_PATTERN).\n' >&2
-		return 2
+		case " $probes " in
+		*" oom "*)
+			printf 'Error: the oom probe needs a PATTERN (pass -p/--pattern or set PROC_PATTERN).\n' >&2
+			return 2
+			;;
+		esac
 	fi
 
 	local t
@@ -569,10 +892,19 @@ _dor_diagnose_tasks() {
 			return 1
 		}
 	done
-	declare -F scan_oom_processes >/dev/null 2>&1 || {
-		printf 'Error: scan_oom_processes not defined.\n' >&2
-		return 1
-	}
+	local pr
+	for pr in $probes; do
+		case "$pr" in
+		oom) declare -F scan_oom_processes >/dev/null 2>&1 || {
+			printf 'Error: scan_oom_processes not defined.\n' >&2
+			return 1
+		} ;;
+		stall) declare -F scan_stall_processes >/dev/null 2>&1 || {
+			printf 'Error: scan_stall_processes not defined.\n' >&2
+			return 1
+		} ;;
+		esac
+	done
 
 	# temp files: input lines, queue->cluster cache, instance->label map
 	local intasks qcache mapf
@@ -636,35 +968,41 @@ _dor_diagnose_tasks() {
 	}
 	printf '==> %s unique instance(s) to check.\n' "$n_inst" >&2
 
-	# diagnose each unique instance
-	local stuck_list="" instance out
+	# diagnose each unique instance, running each selected probe on it
+	local stuck_list="" instance out pr marker
 	while IFS= read -r instance <&3; do
 		[ -z "$instance" ] && continue
-		printf '\n==> [%s] scan_oom_processes "%s"\n' "$instance" "$pattern"
+		printf '\n==> [%s]\n' "$instance"
 		printf '    tasks on this instance:\n'
 		awk -F'\t' -v i="$instance" '$1==i{sub(/^[^\t]*\t/,""); print "      - " $0}' "$mapf"
 
-		out="$(_dor_run_remote "$instance" "$pattern" "$show_all")"
-		if printf '%s' "$out" | grep -q 'STUCK pid(s):'; then
-			stuck_list="${stuck_list}${instance}"$'\n'
-			printf '%s\n' "$out" | sed 's/^/    | /'
-		elif [ -n "$show_all" ]; then
-			printf '%s\n' "$out" | sed 's/^/    | /'
-		else
-			printf '    healthy (no stuck process).\n'
-		fi
+		for pr in $probes; do
+			printf '    -- probe: %s --\n' "$pr"
+			out="$(_dor_run_remote "$instance" "$pattern" "$show_all" "$pr")"
+			# each probe marks a flagged instance with its own sentinel line
+			marker='STUCK pid(s):'
+			[ "$pr" = stall ] && marker='>>> FLAG'
+			if printf '%s' "$out" | grep -q "$marker"; then
+				stuck_list="${stuck_list}${instance}"$'\t'"${pr}"$'\n'
+				printf '%s\n' "$out" | sed 's/^/    | /'
+			elif [ -n "$show_all" ]; then
+				printf '%s\n' "$out" | sed 's/^/    | /'
+			else
+				printf '    %s: ok (no flag).\n' "$pr"
+			fi
+		done
 	done 3< <(cut -f1 "$mapf" | sort -u)
 
 	# summary
 	printf '\n=============================== SUMMARY ===============================\n'
 	if [ -z "$stuck_list" ]; then
-		printf 'No stuck instances.\n'
+		printf 'No flagged instances.\n'
 		return 0
 	fi
-	printf 'STUCK instance(s):\n'
-	printf '%s' "$stuck_list" | while IFS= read -r instance; do
+	printf 'FLAGGED instance(s):\n'
+	printf '%s' "$stuck_list" | while IFS=$'\t' read -r instance pr; do
 		[ -z "$instance" ] && continue
-		printf '\n  %s\n' "$instance"
+		printf '\n  %s  [%s]\n' "$instance" "$pr"
 		awk -F'\t' -v i="$instance" '$1==i{sub(/^[^\t]*\t/,""); print "    - " $0}' "$mapf"
 	done
 	return 2
@@ -929,8 +1267,15 @@ Commands:
   scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN
       On-host check for processes stuck after child OOM kills.
 
-  diagnose_oom_run ...
-      Orchestrate run/workflow/task OOM diagnosis.
+  scan_stall_processes [--window S] [--all] [PATTERN]
+      On-host fast STALL check for split-pipe PRE jobs (HUNG / crash-loop /
+      degraded), with OOM cause attribution. No long sampling window needed.
+      Run on the host where the dispatcher lives.
+
+  diagnose_run [--check oom|stall|all] ...
+      Orchestrate run/workflow/task diagnosis, shipping the chosen probe(s) to
+      each task's EC2 instance (default stall). diagnose_stall_run and
+      diagnose_oom_run are aliases pinned to one probe.
 
   find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
       Find which workflow/run owns a task with the given tag.
@@ -976,9 +1321,21 @@ _xsh_main() {
 		shift
 		scan_oom_processes "$@"
 		;;
-	diagnose_oom_run | diagnose-oom-run)
+	scan_stall_processes | scan-stall-processes)
+		shift
+		scan_stall_processes "$@"
+		;;
+	diagnose_run | diagnose-run)
 		shift
 		_dor_main "$@"
+		;;
+	diagnose_stall_run | diagnose-stall-run)
+		shift
+		_DOR_DEFAULT_CHECK=stall _dor_main "$@"
+		;;
+	diagnose_oom_run | diagnose-oom-run)
+		shift
+		_DOR_DEFAULT_CHECK=oom _dor_main "$@"
 		;;
 	find_run_by_task_tag | find-run-by-task-tag)
 		shift
@@ -1752,9 +2109,18 @@ USAGE
 	echo "stopped."
 }
 
-# Source-compatible wrapper for existing users.
-diagnose_oom_run() {
+# Public umbrella: diagnose a run/workflow/task with one or more on-host probes
+# (select with --check oom|stall|all; default stall). diagnose_stall_run and
+# diagnose_oom_run pin a single probe via _DOR_DEFAULT_CHECK -- a variable, not a
+# positional arg, so every legacy form (incl. the list/tasks subcommands) works.
+diagnose_run() {
 	_dor_main "$@"
+}
+diagnose_stall_run() {
+	_DOR_DEFAULT_CHECK=stall _dor_main "$@"
+}
+diagnose_oom_run() {
+	_DOR_DEFAULT_CHECK=oom _dor_main "$@"
 }
 
 # =============================================================================
