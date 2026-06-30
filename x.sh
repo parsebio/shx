@@ -13,9 +13,10 @@
 #   diagnose_run (umbrella; diagnose_stall_run / diagnose_oom_run pin one probe)
 #
 # No code is duplicated: the Batch->ECS->EC2 trace lives once in
-# _aws_batch_job_to_ec2 (used by both open_task_shell and the diagnoser),
-# and the on-host check is scan_oom_processes, shipped to each instance via
-# `declare -f` and run there as root over SSM.
+# _aws_batch_job_to_ec2 (used by both open_task_shell and the diagnoser). The
+# probes (scan_stall_processes / scan_oom_processes) are procps-free and shipped
+# via `declare -f`, then docker-exec'd INSIDE each task's own container over SSM
+# so the scan sees only that task's PID namespace.
 #
 # Required environment:
 #   API_ACCESS_TOKEN   Personal access token (Authorization: Bearer ...).
@@ -227,6 +228,70 @@ _oom_evidence() {
 }
 
 # =============================================================================
+# Shared: procps-free process discovery (works INSIDE a task container)
+# -----------------------------------------------------------------------------
+# The probes are docker-exec'd into the task's own container so they see only
+# that task's PID namespace. Task containers are minimal and frequently lack
+# procps (pgrep/ps) -- the STAR driver (_sp_star_running) hits the same wall and
+# walks /proc with `find` for exactly this reason. These two helpers are the
+# pgrep replacements; everything else the probes need (cat, tr, awk, sort) is
+# coreutils and present. Shipped alongside the probes via `declare -f`.
+#
+# _proc_cmd PID            -> the process's cmdline (NUL args joined with spaces)
+# _proc_state PID          -> state letter from /proc/PID/stat (R,S,D,Z,...)
+# _proc_pids_matching PAT  -> pids whose cmdline contains substring PAT (pgrep -f)
+# _proc_children PPID      -> direct child pids of PPID (pgrep -P)
+# =============================================================================
+_proc_cmd() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null; }
+
+# state letter from /proc/PID/stat (R,S,D,Z,...); empty if the pid is gone.
+_proc_state() {
+	local raw rest
+	raw=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+	rest=${raw##*") "}
+	set -- $rest
+	printf '%s' "${1:-}"
+}
+
+_proc_pids_matching() {
+	local pat="$1" cmdfile pid cmd
+	[ -d /proc ] || return 0
+	# `find` does the /proc/<pid> enumeration so no glob ever reaches the shell
+	# (zsh aborts on a no-match glob); robust under bash or zsh or `bash -s`.
+	while IFS= read -r cmdfile; do
+		[ -r "$cmdfile" ] || continue
+		cmd=$(tr '\0' ' ' <"$cmdfile" 2>/dev/null)
+		case "$cmd" in
+		*"$pat"*)
+			pid=${cmdfile#/proc/}
+			printf '%s\n' "${pid%/cmdline}"
+			;;
+		esac
+	done <<EOF
+$(find /proc -maxdepth 2 -regex '/proc/[0-9]+/cmdline' 2>/dev/null)
+EOF
+}
+
+_proc_children() {
+	local ppid="$1" statf raw rest
+	[ -d /proc ] || return 0
+	while IFS= read -r statf; do
+		raw=$(cat "$statf" 2>/dev/null) || continue
+		[ -z "$raw" ] && continue
+		# stat: "pid (comm) state ppid ...". comm may hold spaces/parens, so
+		# split AFTER the final ") " -- then $1=state, $2=ppid.
+		rest=${raw##*") "}
+		set -- $rest
+		if [ "${2:-}" = "$ppid" ]; then
+			statf=${statf#/proc/}
+			printf '%s\n' "${statf%/stat}"
+		fi
+	done <<EOF
+$(find /proc -maxdepth 2 -regex '/proc/[0-9]+/stat' 2>/dev/null)
+EOF
+}
+
+# =============================================================================
 # Shared: suggest a pattern when the requested one matched nothing
 # -----------------------------------------------------------------------------
 # Called from a probe's no-match branch (on the remote host). The user asked for
@@ -238,10 +303,11 @@ _oom_evidence() {
 # self-contained.
 # =============================================================================
 _suggest_split_pipe_patterns() {
-	local running modes
-	running=$(pgrep -af 'split-pipe' 2>/dev/null | sed -E 's/^[0-9]+[[:space:]]+//')
+	local running modes p
+	running=$(for p in $(_proc_pids_matching 'split-pipe'); do _proc_cmd "$p"; echo; done)
+	running=$(printf '%s\n' "$running" | sed '/^[[:space:]]*$/d')
 	if [ -z "$running" ]; then
-		echo "  No 'split-pipe' processes are running on this host either."
+		echo "  No 'split-pipe' processes are running in this container either."
 		return 0
 	fi
 	echo "  But 'split-pipe' IS running here. Currently running mode(s):"
@@ -261,18 +327,20 @@ _suggest_split_pipe_patterns() {
 }
 
 # =============================================================================
-# Public: on-host OOM-stuck process finder (run this ON the host)
+# Public: OOM-stuck process finder (run on a host, or docker-exec'd in a container)
 # -----------------------------------------------------------------------------
 # Find processes that are hung because the kernel OOM-killed some of their
-# children but NOT the process itself, leaving the parent deadlocked. A single
-# host can run several instances of the same program at once, each in its own
-# memory cgroup; this walks EVERY process matching a pattern, prints its cgroup
-# + memory facts, and flags the ones that are stuck (OOM-killed children +
-# zombie/defunct children).
+# children but NOT the process itself, leaving the parent deadlocked. It walks
+# EVERY process matching a pattern, prints its cgroup + memory facts, and flags
+# the ones that are stuck (OOM-killed children + zombie/defunct children).
+# Process discovery is procps-free (raw /proc via the _proc_* helpers), so it
+# works inside minimal task containers that lack pgrep/ps -- which is how
+# diagnose_run ships it: docker-exec'd into the task's own container, scoped to
+# that task's PID namespace rather than the whole host.
 #
 # Usage:
-#   scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN
-#   PATTERN is a 'pgrep -f' pattern (or set PROC_PATTERN).
+#   scan_oom_processes [--all|-a] [--match|-m TAG] [-p|--pattern PATTERN] [PATTERN]
+#   PATTERN is matched as a substring of each process's cmdline (or set PROC_PATTERN).
 #
 # Tunables (env): CGROUP_ROOT (default /sys/fs/cgroup), PROC_PATTERN.
 # =============================================================================
@@ -315,7 +383,7 @@ scan_oom_processes() {
 			;;
 		-h | --help)
 			echo "Usage: scan_oom_processes [--all|-a] [--match|-m TAG] [-p|--pattern PATTERN] [PATTERN]"
-			echo "  PATTERN          'pgrep -f' pattern for the process(es) to inspect"
+			echo "  PATTERN          cmdline substring of the process(es) to inspect"
 			echo "                   (positional or via -p/--pattern)"
 			echo "  (default)        print only STUCK matches"
 			echo "  --all            print every match regardless of verdict"
@@ -348,19 +416,19 @@ scan_oom_processes() {
 	local pids pid cg oom_group mem_max mem_cur mem_events zombies oom_kill ev
 	local block is_stuck cmdline matched=0
 
-	pids=$(pgrep -f "$proc_pattern" 2>/dev/null)
+	pids=$(_proc_pids_matching "$proc_pattern")
 
 	if [ -z "$pids" ]; then
 		echo ">>> NO-MATCH: no process matches the pattern: $proc_pattern"
-		echo "  If you expected one, confirm you are on the right host and that the"
-		echo "  process is still running."
+		echo "  If you expected one, confirm you are in the right container and that"
+		echo "  the process is still running."
 		_suggest_split_pipe_patterns
 		return 0
 	fi
 
 	for pid in $pids; do
 		# Full command line tells us which instance/task this is.
-		cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+		cmdline=$(_proc_cmd "$pid")
 
 		# --match: skip matches whose cmdline doesn't contain TAG.
 		if [ -n "$cmd_match" ] && [[ "$cmdline" != *"$cmd_match"* ]]; then
@@ -373,8 +441,13 @@ scan_oom_processes() {
 		IFS=$'\t' read -r cg oom_kill oom_group mem_max mem_cur mem_events <<<"$ev"
 		oom_kill=${oom_kill:-0}
 
-		# Count zombie/defunct direct children the parent can never reap.
-		zombies=$(ps --ppid "$pid" -o stat= 2>/dev/null | grep -c '^Z')
+		# Count zombie/defunct direct children the parent can never reap
+		# (procps-free: walk the parent's children and read each one's state).
+		local _c
+		zombies=0
+		for _c in $(_proc_children "$pid"); do
+			[ "$(_proc_state "$_c")" = "Z" ] && zombies=$((zombies + 1))
+		done
 
 		# Build the per-process report block (so we can choose whether to print it).
 		is_stuck=0
@@ -454,10 +527,11 @@ scan_oom_processes() {
 #
 # Each FLAGGED verdict carries a cause line: OOM (with the oom_kill count and
 # memory limits) when the cgroup shows it, otherwise a pointer to dmesg/logs.
-# Ships via `declare -f scan_stall_processes _oom_evidence`. Lines starting
-# ">>> FLAG" mark an instance needing attention.
+# Process discovery is procps-free (raw /proc via the _proc_* helpers) so it runs
+# inside minimal task containers; diagnose_run docker-exec's it into the task's
+# own container. Lines starting ">>> FLAG" mark a task needing attention.
 #
-# Usage: scan_stall_processes [--window SECONDS] [--all] [PATTERN]
+# Usage: scan_stall_processes [--window SECONDS] [-p|--pattern PATTERN] [--all] [PATTERN]
 #   PATTERN defaults to 'split-pipe --mode pre'; --window defaults to 20s.
 # =============================================================================
 scan_stall_processes() {
@@ -520,7 +594,7 @@ scan_stall_processes() {
 	# recursive descendant walker (a dispatcher's children are its workers)
 	_ssp_desc() {
 		local r=$1 k
-		for k in $(pgrep -P "$r" 2>/dev/null); do
+		for k in $(_proc_children "$r"); do
 			echo "$k"
 			_ssp_desc "$k"
 		done
@@ -547,13 +621,13 @@ scan_stall_processes() {
 	# call, so a respawned dispatcher PID or freshly spawned worker is captured.
 	_ssp_snap() {
 		local disp d c cmd
-		disp=$(pgrep -f "$pattern" 2>/dev/null)
+		disp=$(_proc_pids_matching "$pattern")
 		[ -z "$disp" ] && return 0
 		for d in $disp; do _ssp_row "$d" dispatcher; done
 		for d in $disp; do
 			for c in $(_ssp_desc "$d"); do
 				case " $disp " in *" $c "*) continue ;; esac # nested dispatcher: skip
-				cmd=$( { tr '\0' ' ' <"/proc/$c/cmdline"; } 2>/dev/null)
+				cmd=$(_proc_cmd "$c")
 				case "$cmd" in *mem_loop*) continue ;; esac # memory profiler, not a worker
 				_ssp_row "$c" worker
 			done
@@ -561,7 +635,7 @@ scan_stall_processes() {
 	}
 
 	local disp_list
-	disp_list=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+	disp_list=$(_proc_pids_matching "$pattern" | tr '\n' ' ')
 	disp_list=${disp_list% }
 	if [ -z "$disp_list" ]; then
 		echo ">>> NO-MATCH: no process matches the pattern: $pattern"
@@ -573,7 +647,7 @@ scan_stall_processes() {
 	# WHICH split-pipe is running (a broad pattern can match a non-PRE stage).
 	local d disp_modes
 	disp_modes=$(for d in $disp_list; do
-		tr '\0' ' ' <"/proc/$d/cmdline" 2>/dev/null
+		_proc_cmd "$d"
 		echo
 	done | grep -oE -- '--mode[[:space:]]+[^[:space:]]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
 	disp_modes=${disp_modes% }
@@ -731,8 +805,13 @@ _dor_usage() {
 Usage:
   diagnose_run --run-id <id> [diagnose-args...]       Resolve run -> workflow, diagnose RUNNING tasks
   diagnose_run --workflow-id <id> [diagnose-args...]  Diagnose a workflow's RUNNING tasks
-  diagnose_run list <workflow-id>                     Print "<nativeId><TAB>label" for RUNNING tasks
+  diagnose_run list <workflow-id>                     Print "<nativeId>\t<label>\t<workdir>\t<container>" rows
   diagnose_run tasks [diagnose-args...] [id...]       Diagnose tasks from stdin/args (the back half)
+
+Each task is probed INSIDE its own container (docker exec, its own PID namespace),
+so co-located tasks on the same instance never pollute one another's result. Bare
+native IDs (the 'tasks' subcommand with no workdir/container) fall back to a
+host-wide scan and are labelled as such.
 
 diagnose-args forwarded to the task diagnoser:
   -c, --check oom|stall|all    probe(s) to run (default stall):
@@ -829,7 +908,10 @@ _dor_resolve_workflow_id() {
 }
 
 # --- API: list a workflow's RUNNING tasks ------------------------------------
-# Emits "<nativeId>\tsample=...\tstep=..." lines on stdout.
+# Emits one TSV row per RUNNING task: "<nativeId>\t<label>\t<workdir>\t<container>"
+# where label is "sample=<tag> step=<process>". The workdir + container image
+# let the diagnoser exec the probe inside each task's OWN container (its own PID
+# namespace), instead of a host-wide scan that lumps co-located tasks together.
 _dor_list_running_tasks() {
 	if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
 		printf 'Usage: diagnose_oom_run list <workflow-id>\n' >&2
@@ -856,16 +938,33 @@ _dor_list_running_tasks() {
 
 		jq -r '.tasks[] | (.task // .)
 		         | select(.status=="RUNNING")
-		         | "\(.nativeId)\tsample=\(.tag)\tstep=\(.process)"' <<<"$page"
+		         | [ (.nativeId | tostring),
+		             ("sample=\(.tag) step=\(.process)"),
+		             (.workdir // ""),
+		             (.container // "") ] | @tsv' <<<"$page"
 
 		offset=$((offset + 100))
 		[ "$offset" -ge "$total" ] && break
 	done
 }
 
-# --- diagnostic: run one PROBE on one instance via SSM -----------------------
-# Ships the chosen on-host probe function (whole, via `declare -f`) and runs it.
-# Both probes also need the shared _oom_evidence helper, so it is shipped too.
+# --- shared: the set of functions a probe needs shipped with it --------------
+# Both probes plus the procps-free /proc toolkit and the cgroup/suggestion
+# helpers. Listed once so the host-wide and in-container runners can't drift.
+_dor_probe_func_src() {
+	case "$1" in
+	stall) declare -f scan_stall_processes ;;
+	oom | *) declare -f scan_oom_processes ;;
+	esac
+	declare -f _oom_evidence _suggest_split_pipe_patterns \
+		_proc_cmd _proc_state _proc_pids_matching _proc_children
+}
+
+# --- diagnostic: run one PROBE host-wide on one instance via SSM -------------
+# FALLBACK path, used only when a task's container can't be resolved (no
+# workdir/container from the API). Ships the probe to the host and scans every
+# matching process there -- which, on a host packing several task containers,
+# lumps unrelated tasks together. Prefer _dor_run_in_container.
 #   $1 = EC2 instance id   $2 = process pattern   $3 = extra flags (e.g. --all)
 #   $4 = probe name: oom (scan_oom_processes) | stall (scan_stall_processes)
 _dor_run_remote() {
@@ -877,16 +976,15 @@ _dor_run_remote() {
 		# The stall probe has its own sensible default pattern (the PRE
 		# dispatcher), so an empty pattern is fine here.
 		[ -n "$pattern" ] || pattern='split-pipe --mode pre'
-		func_src="$(declare -f scan_stall_processes _oom_evidence _suggest_split_pipe_patterns)" || return 1
 		call="scan_stall_processes ${extra} $(printf '%q' "$pattern")"
 		comment="scan_stall_processes $pattern"
 		;;
 	oom | *)
-		func_src="$(declare -f scan_oom_processes _oom_evidence _suggest_split_pipe_patterns)" || return 1
 		call="scan_oom_processes ${extra} $(printf '%q' "$pattern")"
 		comment="scan_oom_processes $pattern"
 		;;
 	esac
+	func_src="$(_dor_probe_func_src "$probe")" || return 1
 
 	remote_script="set -u
 ${func_src}
@@ -895,12 +993,77 @@ ${call}"
 	_xsh_ssm_run "$instance" "$remote_script" "$comment"
 }
 
+# --- diagnostic: run one PROBE INSIDE a task's container via SSM -------------
+# The task-scoped path (mirrors _sp_run_remote). Finds THIS task's container on
+# the host -- by the work dir embedded in its immutable launch config, falling
+# back to the image tag -- then docker-exec's the procps-free probe inside it,
+# so the probe sees only this task's PID namespace. No cross-task pollution.
+#   $1 = EC2 instance id   $2 = container image ref   $3 = s3:// work directory
+#   $4 = process pattern   $5 = extra flags (e.g. --all)   $6 = probe: oom|stall
+_dor_run_in_container() {
+	local instance="$1" image="$2" workdir="$3" pattern="$4" extra="$5" probe="${6:-stall}"
+	local tag="${image##*:}"
+	local fusion="/fusion/s3/${workdir#s3://}"
+	local func_src call comment inner_script b64 host_script
+
+	case "$probe" in
+	stall)
+		[ -n "$pattern" ] || pattern='split-pipe --mode pre'
+		call="scan_stall_processes ${extra} $(printf '%q' "$pattern")"
+		comment="stall(in-container) $tag"
+		;;
+	oom | *)
+		call="scan_oom_processes ${extra} $(printf '%q' "$pattern")"
+		comment="oom(in-container) $tag"
+		;;
+	esac
+	func_src="$(_dor_probe_func_src "$probe")" || return 1
+
+	# inner script runs INSIDE the container; base64 so it survives the
+	# docker-exec stdin pipe without quoting hazards (same trick as _sp_run_remote).
+	inner_script="set -u
+${func_src}
+${call}"
+	b64="$(printf '%s' "$inner_script" | base64 | tr -d '\n')"
+
+	# outer script runs on the HOST: locate the task's container, then pipe the
+	# decoded inner script into it. Every remote-evaluated $ is escaped (\$).
+	host_script="set -u
+image=$(printf '%q' "$image")
+tag=$(printf '%q' "$tag")
+fusion=$(printf '%q' "$fusion")
+b64=$(printf '%q' "$b64")
+
+cid=\"\"
+for c in \$(sudo docker ps --no-trunc --format '{{.ID}}'); do
+	if sudo docker inspect \"\$c\" 2>/dev/null | grep -qF -- \"\$fusion\"; then
+		cid=\$c
+		break
+	fi
+done
+if [ -z \"\$cid\" ]; then
+	cid=\$(sudo docker ps --no-trunc | grep -F -- \"\$tag\" | awk '{print \$1}' | head -1)
+	[ -n \"\$cid\" ] && echo \"WARN: no container config referenced \$fusion; falling back to first \$tag container (\$cid). It may belong to a different task.\" >&2
+fi
+if [ -z \"\$cid\" ]; then
+	# stdout (not stderr) so the orchestrator captures + detects this sentinel.
+	echo \">>> NO-CONTAINER: no running container for image \$image (searched by work dir and tag \$tag).\"
+	exit 1
+fi
+echo \"Container id    : \$cid\"
+printf '%s' \"\$b64\" | base64 -d | sudo docker exec -i \"\$cid\" bash -s"
+
+	_xsh_ssm_run "$instance" "$host_script" "$comment"
+}
+
 # --- diagnostic: diagnose a set of tasks -------------------------------------
-# Reads "<nativeId>\t<label>" lines on stdin (or takes native IDs as args),
-# groups by EC2 instance, runs the selected probe(s) on each. The default probe
-# is the symptom-first stall check; callers (diagnose_oom_run) override it to oom
-# by exporting _DOR_DEFAULT_CHECK -- a variable rather than a positional arg, so
-# the list/tasks subcommands keep working.
+# Reads "<nativeId>\t<label>\t<workdir>\t<container>" rows on stdin (or bare
+# native IDs as args), resolves each task to its EC2 instance, and runs the
+# selected probe(s) per task INSIDE that task's own container (docker exec) --
+# falling back to a host-wide scan only when no workdir/container is known. The
+# default probe is the symptom-first stall check; callers (diagnose_oom_run)
+# override it to oom by exporting _DOR_DEFAULT_CHECK -- a variable rather than a
+# positional arg, so the list/tasks subcommands keep working.
 _dor_diagnose_tasks() {
 	local pattern="${PROC_PATTERN:-}" show_all="" probes="${_DOR_DEFAULT_CHECK:-stall}"
 	local -a native_ids=()
@@ -943,7 +1106,10 @@ _dor_diagnose_tasks() {
 			;;
 		-h | --help)
 			printf 'Usage: diagnose_run tasks [-p PATTERN] [-c oom|stall|all] [--all] [nativeId...]\n'
-			printf '  Reads "<nativeId><TAB><label>" lines on stdin if no IDs are given.\n'
+			printf '  Reads "<nativeId>\\t<label>\\t<workdir>\\t<container>" TSV rows on stdin if\n'
+			printf '  no IDs are given (the shape diagnose_run list emits). Rows carrying a\n'
+			printf '  workdir+container are probed INSIDE that container; bare native IDs (and\n'
+			printf '  legacy id-only lines) fall back to a host-wide scan.\n'
 			printf '  -c/--check selects the probe(s) (default stall). The oom probe needs a\n'
 			printf '  PATTERN (-p/--pattern or PROC_PATTERN); the stall probe defaults to\n'
 			printf "  'split-pipe --mode pre'.\n"
@@ -972,7 +1138,7 @@ _dor_diagnose_tasks() {
 	fi
 
 	local t
-	for t in aws jq awk; do
+	for t in aws jq awk base64; do
 		command -v "$t" >/dev/null 2>&1 || {
 			printf 'Error: %s not found.\n' "$t" >&2
 			return 1
@@ -994,9 +1160,10 @@ _dor_diagnose_tasks() {
 
 	# --- announce what we are about to do ------------------------------------
 	# The user should know up front: which probe (mode), which process pattern
-	# it greps for, and -- for the stall probe -- that each instance is sampled
-	# for a churn window, so a stall scan is not instant. The effective stall
-	# pattern is the default when none was given (mirrors scan_stall_processes).
+	# it greps for, that each task is probed INSIDE its own container, and --
+	# for the stall probe -- that each task is sampled for a churn window, so a
+	# stall scan is not instant. The effective stall pattern is the default when
+	# none was given (mirrors scan_stall_processes).
 	local _dor_stall_window=20 mode_desc disp_pattern
 	case "$probes" in
 	stall) mode_desc="stall (symptom-first: HUNG / crash-loop / degraded; no progress/ETA)" ;;
@@ -1009,58 +1176,69 @@ _dor_diagnose_tasks() {
 	fi
 	printf '==> Mode (--check): %s\n' "$mode_desc" >&2
 	printf '==> Process pattern (--pattern): %s\n' "$disp_pattern" >&2
+	printf '==> Each task is probed INSIDE its own container (its own PID namespace),\n' >&2
+	printf '    so co-located tasks no longer pollute the result.\n' >&2
 	case " $probes " in
 	*" stall "*)
-		printf '==> The stall probe samples each instance for ~%ss of churn, sequentially.\n' \
+		printf '==> The stall probe samples each task for ~%ss of churn, sequentially.\n' \
 			"$_dor_stall_window" >&2
-		printf '    Expect roughly ~%ss per instance of waiting (plus SSM overhead).\n' \
+		printf '    Expect roughly ~%ss per task of waiting (plus SSM + docker-exec overhead).\n' \
 			"$_dor_stall_window" >&2
 		;;
 	esac
 
-	# temp files: input lines, queue->cluster cache, instance->label map
-	local intasks qcache mapf
+	# temp files: normalised input lines, queue->cluster cache, resolved worklist
+	local intasks qcache worklist
 	intasks="$(mktemp)"
 	qcache="$(mktemp)"
-	mapf="$(mktemp)"
+	worklist="$(mktemp)"
 	# Clean up temp files when this function returns. bash uses the RETURN
 	# pseudo-signal; zsh has no RETURN trap, but an EXIT trap set inside a
 	# function is function-local there and fires on return -- so pick per shell.
 	if [ -n "${ZSH_VERSION:-}" ]; then
-		trap 'rm -f "$intasks" "$qcache" "$mapf"' EXIT
+		trap 'rm -f "$intasks" "$qcache" "$worklist"' EXIT
 	else
-		trap 'rm -f "$intasks" "$qcache" "$mapf"' RETURN
+		trap 'rm -f "$intasks" "$qcache" "$worklist"' RETURN
 	fi
 
-	# gather input: from args (label = id) or stdin ("<id><TAB><label>")
+	# gather input -> "<nid>\t<label>\t<workdir>\t<container>" lines.
+	#   - args: bare native IDs (no workdir/container -> host-wide fallback).
+	#   - stdin: TSV from _dor_list_running_tasks (4 fields), or a legacy
+	#     "<id> <label>" line (workdir/container empty -> host-wide fallback).
 	if [ ${#native_ids[@]} -gt 0 ]; then
 		local id
-		for id in "${native_ids[@]}"; do printf '%s\t%s\n' "$id" "$id" >>"$intasks"; done
+		for id in "${native_ids[@]}"; do printf '%s\t%s\t\t\n' "$id" "$id" >>"$intasks"; done
 	else
 		if [ -t 0 ]; then
 			printf 'Error: no native IDs given (pass as args or pipe them in).\n' >&2
 			return 1
 		fi
-		# normalise: first whitespace-separated field = id, remainder = label
-		awk '{
-			id=$1
-			lbl=$0; sub(/^[^[:space:]]+[[:space:]]*/, "", lbl)
-			if (lbl=="") lbl=id
-			print id "\t" lbl
+		# Tab-aware: field1=id, field2=label, field3=workdir, field4=container.
+		# A line with no tab is a legacy "id [label...]" form (whitespace-split):
+		# first token = id, the remainder = label, no workdir/container.
+		awk -F'\t' '{
+			if (NF >= 2) { print $1 "\t" $2 "\t" $3 "\t" $4 }
+			else {
+				id=$0;  sub(/[[:space:]].*/, "", id)
+				lbl=$0; sub(/^[^[:space:]]+[[:space:]]*/, "", lbl)
+				if (lbl=="") lbl=id
+				print id "\t" lbl "\t\t"
+			}
 		}' >"$intasks"
 	fi
 
 	local n_in
-	n_in="$(wc -l <"$intasks" | tr -d ' ')"
+	n_in="$(grep -c . "$intasks")"
 	[ "$n_in" -eq 0 ] && {
 		printf 'No native IDs to process.\n' >&2
 		return 1
 	}
 
-	# resolve each task -> EC2; write "<ec2><TAB><label>" to mapf
+	# resolve each task -> EC2; carry workdir/container forward to the worklist
+	# ("<nid>\t<label>\t<workdir>\t<container>\t<ec2>").
 	printf '==> Tracing %s task(s) to EC2 instances...\n' "$n_in" >&2
-	local done_n=0 nid lbl ec2
-	while IFS=$'\t' read -r nid lbl <&3; do
+	local done_n=0 nid lbl workdir container ec2 where
+	while IFS=$'\t' read -r nid lbl workdir container <&3; do
 		[ -z "$nid" ] && continue
 		done_n=$((done_n + 1))
 		ec2="$(_aws_batch_job_to_ec2 "$nid" "$qcache")"
@@ -1068,76 +1246,97 @@ _dor_diagnose_tasks() {
 			printf '    [%s/%s] %s -> (unresolved; job may have ended)\n' "$done_n" "$n_in" "$nid" >&2
 			continue
 		fi
-		printf '    [%s/%s] %s -> %s\n' "$done_n" "$n_in" "$nid" "$ec2" >&2
-		printf '%s\t%s\tnativeId=%s\n' "$ec2" "$lbl" "$nid" >>"$mapf"
+		if [ -n "$workdir" ] && [ -n "$container" ]; then
+			where="container"
+		else
+			where="HOST-WIDE (no workdir/container)"
+		fi
+		printf '    [%s/%s] %s -> %s [%s]\n' "$done_n" "$n_in" "$nid" "$ec2" "$where" >&2
+		printf '%s\t%s\t%s\t%s\t%s\n' "$nid" "$lbl" "$workdir" "$container" "$ec2" >>"$worklist"
 	done 3<"$intasks"
 
-	local n_inst
-	n_inst="$(cut -f1 "$mapf" | sort -u | grep -c .)"
-	[ "$n_inst" -eq 0 ] && {
-		printf 'No instances resolved.\n' >&2
+	local n_tasks
+	n_tasks="$(grep -c . "$worklist")"
+	[ "$n_tasks" -eq 0 ] && {
+		printf 'No tasks resolved to an instance.\n' >&2
 		return 1
 	}
-	printf '==> %s unique instance(s) to check.\n' "$n_inst" >&2
+	printf '==> %s task(s) to check.\n' "$n_tasks" >&2
 	case " $probes " in
 	*" stall "*)
 		printf '==> Stall sampling is sequential: budget roughly ~%ss total. Please wait.\n' \
-			"$((n_inst * _dor_stall_window))" >&2
+			"$((n_tasks * _dor_stall_window))" >&2
 		;;
 	esac
 
-	# diagnose each unique instance, running each selected probe on it
-	local stuck_list="" instance out pr marker
-	while IFS= read -r instance <&3; do
-		[ -z "$instance" ] && continue
-		printf '\n==> [%s]\n' "$instance"
-		printf '    tasks on this instance:\n'
-		awk -F'\t' -v i="$instance" '$1==i{sub(/^[^\t]*\t/,""); print "      - " $0}' "$mapf"
+	# diagnose each task, running each selected probe inside its container
+	# (or host-wide when the container couldn't be resolved).
+	local stuck_list="" out pr marker
+	while IFS=$'\t' read -r nid lbl workdir container ec2 <&3; do
+		[ -z "$nid" ] && continue
+		printf '\n==> [task %s]\n' "$nid"
+		printf '    %s\n' "$lbl"
+		printf '    instance: %s\n' "$ec2"
+		local scoped=1
+		if [ -n "$workdir" ] && [ -n "$container" ]; then
+			printf '    container: image=%s\n' "$container"
+			printf '    workdir  : %s\n' "$workdir"
+		else
+			scoped=0
+			printf '    scope    : HOST-WIDE fallback (no workdir/container; may include co-located tasks)\n'
+		fi
 
 		for pr in $probes; do
 			printf '    -- probe: %s --\n' "$pr"
-			out="$(_dor_run_remote "$instance" "$pattern" "$show_all" "$pr")"
-			# each probe marks a flagged instance with its own sentinel line
+			if [ "$scoped" -eq 1 ]; then
+				out="$(_dor_run_in_container "$ec2" "$container" "$workdir" "$pattern" "$show_all" "$pr")"
+			else
+				out="$(_dor_run_remote "$ec2" "$pattern" "$show_all" "$pr")"
+			fi
+			# each probe marks a flagged task with its own sentinel line
 			marker='STUCK pid(s):'
 			[ "$pr" = stall ] && marker='>>> FLAG'
 			if printf '%s' "$out" | grep -q "$marker"; then
-				stuck_list="${stuck_list}${instance}"$'\t'"${pr}"$'\n'
+				stuck_list="${stuck_list}${nid}"$'\t'"${lbl}"$'\t'"${pr}"$'\n'
+				printf '%s\n' "$out" | sed 's/^/    | /'
+			elif printf '%s' "$out" | grep -q '>>> NO-CONTAINER'; then
+				# couldn't find the container on the host -- surface it, don't hide it.
+				printf '    %s: container not found on host.\n' "$pr"
 				printf '%s\n' "$out" | sed 's/^/    | /'
 			elif printf '%s' "$out" | grep -q '>>> NO-MATCH'; then
-				# The pattern matched no process here -- always surface this
-				# (and any "what IS running" suggestion) rather than report "ok".
-				printf '    %s: pattern not found on this host.\n' "$pr"
+				# The pattern matched no process in this container -- always surface
+				# this (and any "what IS running" suggestion) rather than report "ok".
+				printf '    %s: pattern not found in this container.\n' "$pr"
 				printf '%s\n' "$out" | sed 's/^/    | /'
 			elif [ -n "$show_all" ]; then
 				printf '%s\n' "$out" | sed 's/^/    | /'
 			else
 				# matched, nothing flagged: don't be a black box -- echo what was
-				# matched (modes) and the one-line verdict so the user can see
-				# WHICH split-pipe ran (a broad pattern may match a non-PRE stage).
+				# matched (modes) and the one-line verdict.
 				printf '    %s: ok (no flag).\n' "$pr"
 				if printf '%s' "$out" | grep -q '>>> NOTE:'; then
 					# multi-mode match: show the full output incl. the narrow-down hint
 					printf '%s\n' "$out" | sed 's/^/    | /'
 				else
 					printf '%s\n' "$out" \
-						| grep -E '^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
+						| grep -E '^Container id|^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
 						| sed 's/^/    | /'
 				fi
 			fi
 		done
-	done 3< <(cut -f1 "$mapf" | sort -u)
+	done 3<"$worklist"
 
 	# summary
 	printf '\n=============================== SUMMARY ===============================\n'
 	if [ -z "$stuck_list" ]; then
-		printf 'No flagged instances.\n'
+		printf 'No flagged tasks.\n'
 		return 0
 	fi
-	printf 'FLAGGED instance(s):\n'
-	printf '%s' "$stuck_list" | while IFS=$'\t' read -r instance pr; do
-		[ -z "$instance" ] && continue
-		printf '\n  %s  [%s]\n' "$instance" "$pr"
-		awk -F'\t' -v i="$instance" '$1==i{sub(/^[^\t]*\t/,""); print "    - " $0}' "$mapf"
+	printf 'FLAGGED task(s):\n'
+	printf '%s' "$stuck_list" | while IFS=$'\t' read -r nid lbl pr; do
+		[ -z "$nid" ] && continue
+		printf '\n  %s  [%s]\n' "$nid" "$pr"
+		printf '    - %s\n' "$lbl"
 	done
 	return 2
 }
@@ -1398,18 +1597,20 @@ Commands:
   open_task_shell <job_id>
       Trace a Batch job to its EC2 instance and open an SSM session.
 
-  scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN
-      On-host check for processes stuck after child OOM kills.
+  scan_oom_processes [--all|-a] [--match|-m TAG] [-p PATTERN] [PATTERN]
+      Check for processes stuck after child OOM kills. procps-free (raw /proc),
+      so it runs on a host or docker-exec'd inside a task container.
 
-  scan_stall_processes [--window S] [--all] [PATTERN]
-      On-host fast STALL check for split-pipe PRE jobs (HUNG / crash-loop /
-      degraded), with OOM cause attribution. No long sampling window needed.
-      Run on the host where the dispatcher lives.
+  scan_stall_processes [--window S] [-p PATTERN] [--all] [PATTERN]
+      Fast STALL check for split-pipe jobs (HUNG / crash-loop / degraded), with
+      OOM cause attribution. No long sampling window needed. procps-free, so it
+      runs on the host or inside the task container.
 
   diagnose_run [--check oom|stall|all] ...
-      Orchestrate run/workflow/task diagnosis, shipping the chosen probe(s) to
-      each task's EC2 instance (default stall). diagnose_stall_run and
-      diagnose_oom_run are aliases pinned to one probe.
+      Orchestrate run/workflow/task diagnosis, docker-exec'ing the chosen
+      probe(s) INSIDE each task's own container (default stall) so co-located
+      tasks don't pollute each other. diagnose_stall_run and diagnose_oom_run
+      are aliases pinned to one probe.
 
   find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
       Find which workflow/run owns a task with the given tag.
@@ -2243,10 +2444,11 @@ USAGE
 	echo "stopped."
 }
 
-# Public umbrella: diagnose a run/workflow/task with one or more on-host probes
-# (select with --check oom|stall|all; default stall). diagnose_stall_run and
-# diagnose_oom_run pin a single probe via _DOR_DEFAULT_CHECK -- a variable, not a
-# positional arg, so every legacy form (incl. the list/tasks subcommands) works.
+# Public umbrella: diagnose a run/workflow/task with one or more probes, each
+# docker-exec'd INSIDE the task's own container (select with --check oom|stall|all;
+# default stall). diagnose_stall_run and diagnose_oom_run pin a single probe via
+# _DOR_DEFAULT_CHECK -- a variable, not a positional arg, so every legacy form
+# (incl. the list/tasks subcommands) works.
 diagnose_run() {
 	_dor_main "$@"
 }
