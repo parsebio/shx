@@ -258,7 +258,11 @@ _proc_pids() {
 	done
 }
 
-_proc_cmd() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null; }
+# cmdline with NUL args joined by spaces. 2>/dev/null comes BEFORE the input
+# redirect so that if the pid vanished (a transient process reaped between
+# enumeration and read), the shell's "No such file" message is suppressed too,
+# not just tr's stderr.
+_proc_cmd() { tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline"; }
 
 # state letter from /proc/PID/stat (R,S,D,Z,...); empty if the pid is gone.
 _proc_state() {
@@ -315,12 +319,14 @@ EOF
 # live process; the most useful next thing is to show what IS running so they
 # can re-target. If 'split-pipe' processes exist, distil them to their
 # `--mode <X>` (the canonical pattern axis). Otherwise -- the case where the
-# task is between split-pipe sub-phases, or running it under a name that does
-# not contain the literal "split-pipe" -- list EVERY userspace process so the
-# message is never a dead end. Shipped via `declare -f`; stays self-contained.
+# task is between split-pipe sub-phases (e.g. WT:DGE shelling out to cp/STAR) --
+# say so; and only when asked (show_all=1) dump every userspace process, since
+# the full Nextflow/fusion plumbing list is noise by default.
+#   $1 = show_all (1 to list all container processes on no split-pipe match)
+# Shipped via `declare -f`; stays self-contained.
 # =============================================================================
 _suggest_split_pipe_patterns() {
-	local running modes p
+	local show_all="${1:-0}" running modes p
 	running=$(for p in $(_proc_pids_matching 'split-pipe'); do _proc_cmd "$p"; echo; done)
 	running=$(printf '%s\n' "$running" | sed '/^[[:space:]]*$/d')
 	if [ -n "$running" ]; then
@@ -341,19 +347,26 @@ _suggest_split_pipe_patterns() {
 		return 0
 	fi
 
-	# No 'split-pipe' in any cmdline. Don't assert "nothing here" -- show the
-	# actual userspace processes so the user can pick a real pattern. (split-pipe
-	# may be between sub-phases, e.g. WT:MOL shelling out to STAR/samtools.)
-	local all
-	all=$(_proc_userspace)
-	if [ -z "$all" ]; then
-		echo "  No userspace processes are visible in this container at all"
-		echo "  (only kernel threads, or /proc is not readable here)."
-		return 0
+	# No 'split-pipe' in any cmdline. Keep it terse by default; the full process
+	# table is mostly Nextflow/fusion plumbing, so dump it only on --all.
+	echo "  No 'split-pipe' command line is running in this container right now"
+	echo "  (the task may be between split-pipe sub-phases, e.g. copying output)."
+	if [ "$show_all" = 1 ]; then
+		local all
+		all=$(_proc_userspace)
+		if [ -n "$all" ]; then
+			echo "  All userspace processes in THIS container:"
+			printf '%s\n' "$all" | sed 's/^/    [pid /; s/\t/] /' | cut -c1-160
+			echo "  Re-run with  -p/--pattern '<substring of a command line above>'  to target one."
+		else
+			echo "  (no userspace processes visible / /proc not readable here)."
+		fi
+	else
+		local n
+		n=$(_proc_userspace | grep -c .)
+		echo "  ${n} other userspace process(es) are running; re-run with -a/--all to list them,"
+		echo "  or pass -p/--pattern '<substring>' to target a specific one."
 	fi
-	echo "  No 'split-pipe' command line is running right now. Processes in THIS container:"
-	printf '%s\n' "$all" | sed 's/^/    [pid /; s/\t/] /' | cut -c1-160
-	echo "  Re-run with  -p/--pattern '<substring of one of the command lines above>'."
 }
 
 # =============================================================================
@@ -452,7 +465,7 @@ scan_oom_processes() {
 		echo ">>> NO-MATCH: no process matches the pattern: $proc_pattern"
 		echo "  If you expected one, confirm you are in the right container and that"
 		echo "  the process is still running."
-		_suggest_split_pipe_patterns
+		_suggest_split_pipe_patterns "$show_all"
 		return 0
 	fi
 
@@ -669,7 +682,7 @@ scan_stall_processes() {
 	disp_list=${disp_list% }
 	if [ -z "$disp_list" ]; then
 		echo ">>> NO-MATCH: no process matches the pattern: $pattern"
-		_suggest_split_pipe_patterns
+		_suggest_split_pipe_patterns "$show_all"
 		return 0
 	fi
 
