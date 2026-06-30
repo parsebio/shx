@@ -543,11 +543,20 @@ scan_stall_processes() {
 		return 0
 	fi
 
+	# Name the modes actually matched, so even a benign verdict tells the caller
+	# WHICH split-pipe is running (a broad pattern can match a non-PRE stage).
+	local d disp_modes
+	disp_modes=$(for d in $disp_list; do
+		tr '\0' ' ' <"/proc/$d/cmdline" 2>/dev/null
+		echo
+	done | grep -oE -- '--mode[[:space:]]+[^[:space:]]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
+	disp_modes=${disp_modes% }
+
 	local f1 f2
 	f1=$(mktemp)
 	f2=$(mktemp)
 	_ssp_snap >"$f1"
-	echo "Dispatcher(s): $disp_list   |   sampling ${window}s for churn ..."
+	echo "Dispatcher(s): $disp_list   |   modes: ${disp_modes:-<none>}   |   sampling ${window}s for churn ..."
 	sleep "$window"
 	_ssp_snap >"$f2"
 
@@ -1061,7 +1070,13 @@ _dor_diagnose_tasks() {
 			elif [ -n "$show_all" ]; then
 				printf '%s\n' "$out" | sed 's/^/    | /'
 			else
+				# matched, nothing flagged: don't be a black box -- echo what was
+				# matched (modes) and the one-line verdict so the user can see
+				# WHICH split-pipe ran (a broad pattern may match a non-PRE stage).
 				printf '    %s: ok (no flag).\n' "$pr"
+				printf '%s\n' "$out" \
+					| grep -E '^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
+					| sed 's/^/    | /'
 			fi
 		done
 	done 3< <(cut -f1 "$mapf" | sort -u)
