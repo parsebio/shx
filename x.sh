@@ -1101,6 +1101,29 @@ printf '%s' \"\$b64\" | base64 -d | sudo docker exec -i \"\$cid\" bash -s"
 	_xsh_ssm_run "$instance" "$host_script" "$comment"
 }
 
+# --- display: colorize status lines on a TTY ---------------------------------
+# Whole-line ANSI coloring keyed on the status token a line contains. Runs at
+# the LOCAL display layer (the probes run remotely and their output is captured
+# as text), and is a no-op pass-through when stdout is not a terminal -- so
+# piping/redirecting diagnose_run yields clean, escape-free text. Tiers:
+#   green  = healthy/OK  | yellow = attention/degraded/no-match
+#   red    = flagged/critical | dim = neutral context
+# Note: DEGRADED is yellow even though its line begins ">>> FLAG:", so it is
+# matched (warn) before the red HUNG/CRASH-LOOP tokens.
+_dr_colorize() {
+	if [ ! -t 1 ]; then cat; return; fi
+	awk '
+	BEGIN { ok="\033[32m"; warn="\033[33m"; crit="\033[31m"; dim="\033[2m"; rst="\033[0m" }
+	{
+		c=""
+		if      ($0 ~ /(DEGRADED|IDLE\/STALLED|OOM occurred|>>> NO-MATCH|pattern not found|>>> NOTE|HOST-WIDE)/) c=warn
+		else if ($0 ~ /(CRASH-LOOP|HUNG|STUCK|>>> NO-CONTAINER|container not found|FLAGGED task|Likely cause: OOM)/) c=crit
+		else if ($0 ~ /(WORKING:|ACTIVE \(parent-side\)|healthy \(no oom_kill|OK \(no flag\)|No flagged tasks)/) c=ok
+		else if ($0 ~ /Cause: not OOM/) c=dim
+		if (c != "") print c $0 rst; else print
+	}'
+}
+
 # --- diagnostic: diagnose a set of tasks -------------------------------------
 # Reads "<nativeId>\t<label>\t<workdir>\t<container>" rows on stdin (or bare
 # native IDs as args), resolves each task to its EC2 instance, and runs the
@@ -1373,7 +1396,7 @@ _dr_diagnose_tasks() {
 			printf '    workdir  : %s\n' "$workdir"
 		else
 			scoped=0
-			printf '    scope    : HOST-WIDE fallback (no workdir/container; may include co-located tasks)\n'
+			printf '    scope    : HOST-WIDE fallback (no workdir/container; may include co-located tasks)\n' | _dr_colorize
 		fi
 
 		for pr in $probes; do
@@ -1388,29 +1411,29 @@ _dr_diagnose_tasks() {
 			[ "$pr" = stall ] && marker='>>> FLAG'
 			if printf '%s' "$out" | grep -q "$marker"; then
 				stuck_list="${stuck_list}${nid}"$'\t'"${lbl}"$'\t'"${pr}"$'\n'
-				printf '%s\n' "$out" | sed 's/^/    | /'
+				printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
 			elif printf '%s' "$out" | grep -q '>>> NO-CONTAINER'; then
 				# couldn't find the container on the host -- surface it, don't hide it.
-				printf '    %s: container not found on host.\n' "$pr"
-				printf '%s\n' "$out" | sed 's/^/    | /'
+				printf '    %s: container not found on host.\n' "$pr" | _dr_colorize
+				printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
 			elif printf '%s' "$out" | grep -q '>>> NO-MATCH'; then
 				# The pattern matched no process in this container -- always surface
 				# this (and any "what IS running" suggestion) rather than report "ok".
-				printf '    %s: pattern not found in this container.\n' "$pr"
-				printf '%s\n' "$out" | sed 's/^/    | /'
+				printf '    %s: pattern not found in this container.\n' "$pr" | _dr_colorize
+				printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
 			elif [ -n "$show_all" ]; then
-				printf '%s\n' "$out" | sed 's/^/    | /'
+				printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
 			else
 				# matched, nothing flagged: don't be a black box -- echo what was
 				# matched (modes) and the one-line verdict.
-				printf '    %s: ok (no flag).\n' "$pr"
+				printf '    %s: OK (no flag).\n' "$pr" | _dr_colorize
 				if printf '%s' "$out" | grep -q '>>> NOTE:'; then
 					# multi-mode match: show the full output incl. the narrow-down hint
-					printf '%s\n' "$out" | sed 's/^/    | /'
+					printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
 				else
 					printf '%s\n' "$out" \
 						| grep -E '^Container id|^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
-						| sed 's/^/    | /'
+						| sed 's/^/    | /' | _dr_colorize
 				fi
 			fi
 		done
@@ -1419,10 +1442,10 @@ _dr_diagnose_tasks() {
 	# summary
 	printf '\n=============================== SUMMARY ===============================\n'
 	if [ -z "$stuck_list" ]; then
-		printf 'No flagged tasks.\n'
+		printf 'No flagged tasks.\n' | _dr_colorize
 		return 0
 	fi
-	printf 'FLAGGED task(s):\n'
+	printf 'FLAGGED task(s):\n' | _dr_colorize
 	printf '%s' "$stuck_list" | while IFS=$'\t' read -r nid lbl pr; do
 		[ -z "$nid" ] && continue
 		printf '\n  %s  [%s]\n' "$nid" "$pr"
