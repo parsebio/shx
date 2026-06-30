@@ -1118,7 +1118,7 @@ _dr_colorize() {
 		c=""
 		if      ($0 ~ /(DEGRADED|IDLE\/STALLED|OOM occurred|>>> NO-MATCH|pattern not found|>>> NOTE|HOST-WIDE)/) c=warn
 		else if ($0 ~ /(CRASH-LOOP|HUNG|STUCK|>>> NO-CONTAINER|container not found|FLAGGED task|Likely cause: OOM)/) c=crit
-		else if ($0 ~ /(WORKING:|ACTIVE \(parent-side\)|healthy \(no oom_kill|OK \(no flag\)|No flagged tasks)/) c=ok
+		else if ($0 ~ /(WORKING:|ACTIVE \(parent-side\)|healthy \(no oom_kill|OK \(no flag\)|No flagged tasks|No stuck process identified)/) c=ok
 		else if ($0 ~ /Cause: not OOM/) c=dim
 		if (c != "") print c $0 rst; else print
 	}'
@@ -1431,8 +1431,11 @@ _dr_diagnose_tasks() {
 					# multi-mode match: show the full output incl. the narrow-down hint
 					printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
 				else
+					# surface each probe's one-line verdict: stall -> Dispatcher/
+					# WORKING/ACTIVE/IDLE; oom -> its "No stuck process ..." summary
+					# (+ the --all hint, since oom hides memory facts by default).
 					printf '%s\n' "$out" \
-						| grep -E '^Container id|^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
+						| grep -E '^Container id|^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED|^No stuck process identified|^Re-run with --all' \
 						| sed 's/^/    | /' | _dr_colorize
 				fi
 			fi
