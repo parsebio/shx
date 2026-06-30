@@ -237,11 +237,27 @@ _oom_evidence() {
 # pgrep replacements; everything else the probes need (cat, tr, awk, sort) is
 # coreutils and present. Shipped alongside the probes via `declare -f`.
 #
+# _proc_pids               -> every live pid, one per line (the enumerator)
 # _proc_cmd PID            -> the process's cmdline (NUL args joined with spaces)
 # _proc_state PID          -> state letter from /proc/PID/stat (R,S,D,Z,...)
 # _proc_pids_matching PAT  -> pids whose cmdline contains substring PAT (pgrep -f)
 # _proc_children PPID      -> direct child pids of PPID (pgrep -P)
+# _proc_userspace          -> "pid<TAB>cmdline" for every process with a cmdline
+#                             (i.e. real userspace procs, not kernel threads)
 # =============================================================================
+
+# Enumerate pids without procps. Match pid dirs by NAME glob ('[0-9]*'), NOT by
+# `-regex`: GNU find's default -regex is emacs-flavoured ('+' = one-or-more) but
+# busybox/BSD find treat '+' literally, so a -regex enumeration silently returns
+# nothing there -- which would make every pattern look absent. `-name` glob
+# matching behaves the same across GNU/BSD/busybox.
+_proc_pids() {
+	[ -d /proc ] || return 0
+	find /proc -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | while IFS= read -r d; do
+		printf '%s\n' "${d#/proc/}"
+	done
+}
+
 _proc_cmd() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null; }
 
 # state letter from /proc/PID/stat (R,S,D,Z,...); empty if the pid is gone.
@@ -254,76 +270,90 @@ _proc_state() {
 }
 
 _proc_pids_matching() {
-	local pat="$1" cmdfile pid cmd
-	[ -d /proc ] || return 0
-	# `find` does the /proc/<pid> enumeration so no glob ever reaches the shell
-	# (zsh aborts on a no-match glob); robust under bash or zsh or `bash -s`.
-	while IFS= read -r cmdfile; do
-		[ -r "$cmdfile" ] || continue
-		cmd=$(tr '\0' ' ' <"$cmdfile" 2>/dev/null)
-		case "$cmd" in
-		*"$pat"*)
-			pid=${cmdfile#/proc/}
-			printf '%s\n' "${pid%/cmdline}"
-			;;
-		esac
+	local pat="$1" pid cmd
+	while IFS= read -r pid; do
+		[ -n "$pid" ] || continue
+		cmd=$(_proc_cmd "$pid")
+		case "$cmd" in *"$pat"*) printf '%s\n' "$pid" ;; esac
 	done <<EOF
-$(find /proc -maxdepth 2 -regex '/proc/[0-9]+/cmdline' 2>/dev/null)
+$(_proc_pids)
 EOF
 }
 
 _proc_children() {
-	local ppid="$1" statf raw rest
-	[ -d /proc ] || return 0
-	while IFS= read -r statf; do
-		raw=$(cat "$statf" 2>/dev/null) || continue
+	local ppid="$1" pid raw rest
+	while IFS= read -r pid; do
+		[ -n "$pid" ] || continue
+		raw=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
 		[ -z "$raw" ] && continue
 		# stat: "pid (comm) state ppid ...". comm may hold spaces/parens, so
 		# split AFTER the final ") " -- then $1=state, $2=ppid.
 		rest=${raw##*") "}
 		set -- $rest
-		if [ "${2:-}" = "$ppid" ]; then
-			statf=${statf#/proc/}
-			printf '%s\n' "${statf%/stat}"
-		fi
+		[ "${2:-}" = "$ppid" ] && printf '%s\n' "$pid"
 	done <<EOF
-$(find /proc -maxdepth 2 -regex '/proc/[0-9]+/stat' 2>/dev/null)
+$(_proc_pids)
+EOF
+}
+
+_proc_userspace() {
+	local pid cmd
+	while IFS= read -r pid; do
+		[ -n "$pid" ] || continue
+		cmd=$(_proc_cmd "$pid")
+		# kernel threads have an empty cmdline -- skip them, list real processes.
+		[ -n "${cmd// /}" ] && printf '%s\t%s\n' "$pid" "$cmd"
+	done <<EOF
+$(_proc_pids)
 EOF
 }
 
 # =============================================================================
 # Shared: suggest a pattern when the requested one matched nothing
 # -----------------------------------------------------------------------------
-# Called from a probe's no-match branch (on the remote host). The user asked for
-# a pattern that has no live processes; the most useful next thing is "here is
-# what 'split-pipe' IS running right now, and how to target it". Distils the
-# running command lines down to their `--mode <X>` (the canonical pattern axis),
-# falling back to the trimmed command lines when no `--mode` is present.
-# Shipped to remote hosts alongside the probes via `declare -f`, so it must stay
-# self-contained.
+# Called from a probe's no-match branch. The user asked for a pattern with no
+# live process; the most useful next thing is to show what IS running so they
+# can re-target. If 'split-pipe' processes exist, distil them to their
+# `--mode <X>` (the canonical pattern axis). Otherwise -- the case where the
+# task is between split-pipe sub-phases, or running it under a name that does
+# not contain the literal "split-pipe" -- list EVERY userspace process so the
+# message is never a dead end. Shipped via `declare -f`; stays self-contained.
 # =============================================================================
 _suggest_split_pipe_patterns() {
 	local running modes p
 	running=$(for p in $(_proc_pids_matching 'split-pipe'); do _proc_cmd "$p"; echo; done)
 	running=$(printf '%s\n' "$running" | sed '/^[[:space:]]*$/d')
-	if [ -z "$running" ]; then
-		echo "  No 'split-pipe' processes are running in this container either."
+	if [ -n "$running" ]; then
+		echo "  But 'split-pipe' IS running here. Currently running mode(s):"
+		modes=$(printf '%s\n' "$running" | grep -oE -- '--mode[[:space:]]+[^[:space:]]+' \
+			| awk '{print $2}' | sort -u)
+		if [ -n "$modes" ]; then
+			local m
+			printf '%s\n' "$modes" | while IFS= read -r m; do
+				[ -z "$m" ] && continue
+				printf "    - 'split-pipe --mode %s'\n" "$m"
+			done
+			echo "  Re-run with  -p/--pattern 'split-pipe --mode <mode>'  to target one of these."
+		else
+			printf '%s\n' "$running" | sort -u | sed 's/^/    - /'
+			echo "  Re-run with  -p/--pattern '<command substring>'  to target one of these."
+		fi
 		return 0
 	fi
-	echo "  But 'split-pipe' IS running here. Currently running mode(s):"
-	modes=$(printf '%s\n' "$running" | grep -oE -- '--mode[[:space:]]+[^[:space:]]+' \
-		| awk '{print $2}' | sort -u)
-	if [ -n "$modes" ]; then
-		local m
-		printf '%s\n' "$modes" | while IFS= read -r m; do
-			[ -z "$m" ] && continue
-			printf "    - 'split-pipe --mode %s'\n" "$m"
-		done
-		echo "  Re-run with  -p/--pattern 'split-pipe --mode <mode>'  to target one of these."
-	else
-		printf '%s\n' "$running" | sort -u | sed 's/^/    - /'
-		echo "  Re-run with  -p/--pattern '<command substring>'  to target one of these."
+
+	# No 'split-pipe' in any cmdline. Don't assert "nothing here" -- show the
+	# actual userspace processes so the user can pick a real pattern. (split-pipe
+	# may be between sub-phases, e.g. WT:MOL shelling out to STAR/samtools.)
+	local all
+	all=$(_proc_userspace)
+	if [ -z "$all" ]; then
+		echo "  No userspace processes are visible in this container at all"
+		echo "  (only kernel threads, or /proc is not readable here)."
+		return 0
 	fi
+	echo "  No 'split-pipe' command line is running right now. Processes in THIS container:"
+	printf '%s\n' "$all" | sed 's/^/    [pid /; s/\t/] /' | cut -c1-160
+	echo "  Re-run with  -p/--pattern '<substring of one of the command lines above>'."
 }
 
 # =============================================================================
@@ -957,7 +987,7 @@ _dor_probe_func_src() {
 	oom | *) declare -f scan_oom_processes ;;
 	esac
 	declare -f _oom_evidence _suggest_split_pipe_patterns \
-		_proc_cmd _proc_state _proc_pids_matching _proc_children
+		_proc_pids _proc_cmd _proc_state _proc_pids_matching _proc_children _proc_userspace
 }
 
 # --- diagnostic: run one PROBE host-wide on one instance via SSM -------------
