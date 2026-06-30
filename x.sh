@@ -319,7 +319,7 @@ EOF
 # live process; the most useful next thing is to show what IS running so they
 # can re-target. If 'split-pipe' processes exist, distil them to their
 # `--mode <X>` (the canonical pattern axis). Otherwise -- the case where the
-# task is between split-pipe sub-phases (e.g. WT:DGE shelling out to cp/STAR) --
+# task is between split-pipe sub-phases (e.g. shelling out to cp/STAR) --
 # say so; and only when asked (show_all=1) dump every userspace process, since
 # the full Nextflow/fusion plumbing list is noise by default.
 #   $1 = show_all (1 to list all container processes on no split-pipe match)
@@ -865,7 +865,7 @@ diagnose-args forwarded to the task diagnoser:
   -p, --pattern PATTERN        process pattern (oom needs this or PROC_PATTERN;
                                  stall defaults to 'split-pipe --mode pre')
   -s, --step STEP              only tasks whose Nextflow step matches STEP
-                                 (case-insensitive substring, e.g. WT:PRE)
+                                 (case-insensitive substring)
   -a, --all                    print every match, not just flagged ones
 
 Aliases: diagnose_stall_run pins --check stall; diagnose_oom_run pins --check oom.
@@ -1126,7 +1126,7 @@ _dor_diagnose_tasks() {
 			;;
 		-s | --step | --process)
 			if [ -z "${2:-}" ]; then
-				printf 'Error: %s requires a STEP argument (e.g. WT:PRE).\n' "$1" >&2
+				printf 'Error: %s requires a STEP argument.\n' "$1" >&2
 				return 2
 			fi
 			step_filter="$2"
@@ -1172,7 +1172,7 @@ _dor_diagnose_tasks() {
 			printf '  PATTERN (-p/--pattern or PROC_PATTERN); the stall probe defaults to\n'
 			printf "  'split-pipe --mode pre'.\n"
 			printf '  -s/--step STEP keeps only tasks whose Nextflow step matches STEP\n'
-			printf '  (case-insensitive substring, e.g. WT:PRE).\n'
+			printf '  (case-insensitive substring).\n'
 			return 0
 			;;
 		-*)
@@ -1180,7 +1180,7 @@ _dor_diagnose_tasks() {
 			return 2
 			;;
 		*)
-			native_ids[${#native_ids[@]}]="$1"
+			native_ids+=("$1")
 			shift
 			;;
 		esac
@@ -1297,8 +1297,8 @@ _dor_diagnose_tasks() {
 
 	# --- optional: keep only tasks whose Nextflow step matches --step ---------
 	# The step lives in the label as "step=<process>". Match is case-insensitive
-	# substring, so --step WT:PRE selects "WT:PRE" (and any "...:WT:PRE"). On no
-	# match, list the steps that ARE running so the filter can be corrected.
+	# substring, so --step <name> selects any step whose process name contains
+	# <name>. On no match, list the steps that ARE running so it can be corrected.
 	if [ -n "$step_filter" ]; then
 		local kept
 		kept="$(mktemp)"
@@ -1515,7 +1515,7 @@ _dor_main() {
 			shift
 			;;
 		*)
-			rest[${#rest[@]}]="$1"
+			rest+=("$1")
 			shift
 			;;
 		esac
