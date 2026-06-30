@@ -864,6 +864,8 @@ diagnose-args forwarded to the task diagnoser:
                                           child OOM -> stuck parent)
   -p, --pattern PATTERN        process pattern (oom needs this or PROC_PATTERN;
                                  stall defaults to 'split-pipe --mode pre')
+  -s, --step STEP              only tasks whose Nextflow step matches STEP
+                                 (case-insensitive substring, e.g. WT:PRE)
   -a, --all                    print every match, not just flagged ones
 
 Aliases: diagnose_stall_run pins --check stall; diagnose_oom_run pins --check oom.
@@ -1109,6 +1111,7 @@ printf '%s' \"\$b64\" | base64 -d | sudo docker exec -i \"\$cid\" bash -s"
 # positional arg, so the list/tasks subcommands keep working.
 _dor_diagnose_tasks() {
 	local pattern="${PROC_PATTERN:-}" show_all="" probes="${_DOR_DEFAULT_CHECK:-stall}"
+	local step_filter=""
 	local -a native_ids=()
 
 	while [ $# -gt 0 ]; do
@@ -1120,6 +1123,18 @@ _dor_diagnose_tasks() {
 			fi
 			pattern="$2"
 			shift 2
+			;;
+		-s | --step | --process)
+			if [ -z "${2:-}" ]; then
+				printf 'Error: %s requires a STEP argument (e.g. WT:PRE).\n' "$1" >&2
+				return 2
+			fi
+			step_filter="$2"
+			shift 2
+			;;
+		--step=* | --process=*)
+			step_filter="${1#*=}"
+			shift
 			;;
 		-c | --check)
 			case "${2:-}" in
@@ -1148,7 +1163,7 @@ _dor_diagnose_tasks() {
 			shift
 			;;
 		-h | --help)
-			printf 'Usage: diagnose_run tasks [-p PATTERN] [-c oom|stall|all] [--all] [nativeId...]\n'
+			printf 'Usage: diagnose_run tasks [-p PATTERN] [-c oom|stall|all] [-s STEP] [--all] [nativeId...]\n'
 			printf '  Reads "<nativeId>\\t<label>\\t<workdir>\\t<container>" TSV rows on stdin if\n'
 			printf '  no IDs are given (the shape diagnose_run list emits). Rows carrying a\n'
 			printf '  workdir+container are probed INSIDE that container; bare native IDs (and\n'
@@ -1156,6 +1171,8 @@ _dor_diagnose_tasks() {
 			printf '  -c/--check selects the probe(s) (default stall). The oom probe needs a\n'
 			printf '  PATTERN (-p/--pattern or PROC_PATTERN); the stall probe defaults to\n'
 			printf "  'split-pipe --mode pre'.\n"
+			printf '  -s/--step STEP keeps only tasks whose Nextflow step matches STEP\n'
+			printf '  (case-insensitive substring, e.g. WT:PRE).\n'
 			return 0
 			;;
 		-*)
@@ -1219,6 +1236,7 @@ _dor_diagnose_tasks() {
 	fi
 	printf '==> Mode (--check): %s\n' "$mode_desc" >&2
 	printf '==> Process pattern (--pattern): %s\n' "$disp_pattern" >&2
+	[ -n "$step_filter" ] && printf '==> Step filter (--step): %s\n' "$step_filter" >&2
 	printf '==> Each task is probed INSIDE its own container (its own PID namespace),\n' >&2
 	printf '    so co-located tasks no longer pollute the result.\n' >&2
 	case " $probes " in
@@ -1276,6 +1294,35 @@ _dor_diagnose_tasks() {
 		printf 'No native IDs to process.\n' >&2
 		return 1
 	}
+
+	# --- optional: keep only tasks whose Nextflow step matches --step ---------
+	# The step lives in the label as "step=<process>". Match is case-insensitive
+	# substring, so --step WT:PRE selects "WT:PRE" (and any "...:WT:PRE"). On no
+	# match, list the steps that ARE running so the filter can be corrected.
+	if [ -n "$step_filter" ]; then
+		local kept
+		kept="$(mktemp)"
+		awk -F'\t' -v want="$step_filter" '
+			BEGIN { w = tolower(want) }
+			{
+				step = $2
+				sub(/^.*step=/, "", step)   # "" if the label has no step= field
+				if (index(tolower(step), w) > 0) print
+			}' "$intasks" >"$kept"
+		local n_kept
+		n_kept="$(grep -c . "$kept")"
+		if [ "$n_kept" -eq 0 ]; then
+			printf "Error: --step '%s' matched none of the %s running task(s).\n" "$step_filter" "$n_in" >&2
+			printf 'Steps currently running in this workflow:\n' >&2
+			awk -F'\t' '{ s=$2; sub(/^.*step=/, "", s); if (s=="") s="(no step)"; print s }' "$intasks" \
+				| sort | uniq -c | sort -rn | sed 's/^/    /' >&2
+			return 1
+		fi
+		cat "$kept" >"$intasks"
+		rm -f "$kept"
+		printf "==> Step filter (--step '%s'): %s of %s task(s) match.\n" "$step_filter" "$n_kept" "$n_in" >&2
+		n_in="$n_kept"
+	fi
 
 	# resolve each task -> EC2; carry workdir/container forward to the worklist
 	# ("<nid>\t<label>\t<workdir>\t<container>\t<ec2>").
