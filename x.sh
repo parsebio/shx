@@ -821,11 +821,11 @@ scan_stall_processes() {
 }
 
 # =============================================================================
-# diagnose_run internals (namespaced _dor_)
+# diagnose_run internals (namespaced _dr_)
 # =============================================================================
 
 # --- private: fail-fast preflight (env + required commands) ------------------
-_dor_preflight() {
+_dr_preflight() {
 	local missing="" cmd
 	[ -z "${API_ACCESS_TOKEN:-}" ] && missing="$missing API_ACCESS_TOKEN"
 	[ -z "${WORKSPACE_ID:-}" ] && missing="$missing WORKSPACE_ID"
@@ -843,7 +843,7 @@ _dor_preflight() {
 }
 
 # --- private: usage ----------------------------------------------------------
-_dor_usage() {
+_dr_usage() {
 	cat >&2 <<'EOF'
 Usage:
   diagnose_run --run-id <id> [diagnose-args...]       Resolve run -> workflow, diagnose RUNNING tasks
@@ -876,12 +876,12 @@ EOF
 
 # --- API: resolve a run name/ID to a workflow ID -----------------------------
 # Bare ID on stdout; resolution details and errors on stderr (safe to capture).
-_dor_resolve_workflow_id() {
+_dr_resolve_workflow_id() {
 	[ $# -lt 1 ] && {
 		printf 'diagnose_oom_run: --run-id requires a value\n' >&2
 		return 2
 	}
-	_dor_preflight curl jq awk || return 1
+	_dr_preflight curl jq awk || return 1
 
 	local run="$1"
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
@@ -957,12 +957,12 @@ _dor_resolve_workflow_id() {
 # where label is "sample=<tag> step=<process>". The workdir + container image
 # let the diagnoser exec the probe inside each task's OWN container (its own PID
 # namespace), instead of a host-wide scan that lumps co-located tasks together.
-_dor_list_running_tasks() {
+_dr_list_running_tasks() {
 	if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
 		printf 'Usage: diagnose_oom_run list <workflow-id>\n' >&2
 		return 2
 	fi
-	_dor_preflight curl jq || return 1
+	_dr_preflight curl jq || return 1
 
 	local wf="$1"
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
@@ -996,7 +996,7 @@ _dor_list_running_tasks() {
 # --- shared: the set of functions a probe needs shipped with it --------------
 # Both probes plus the procps-free /proc toolkit and the cgroup/suggestion
 # helpers. Listed once so the host-wide and in-container runners can't drift.
-_dor_probe_func_src() {
+_dr_probe_func_src() {
 	case "$1" in
 	stall) declare -f scan_stall_processes ;;
 	oom | *) declare -f scan_oom_processes ;;
@@ -1009,10 +1009,10 @@ _dor_probe_func_src() {
 # FALLBACK path, used only when a task's container can't be resolved (no
 # workdir/container from the API). Ships the probe to the host and scans every
 # matching process there -- which, on a host packing several task containers,
-# lumps unrelated tasks together. Prefer _dor_run_in_container.
+# lumps unrelated tasks together. Prefer _dr_run_in_container.
 #   $1 = EC2 instance id   $2 = process pattern   $3 = extra flags (e.g. --all)
 #   $4 = probe name: oom (scan_oom_processes) | stall (scan_stall_processes)
-_dor_run_remote() {
+_dr_run_remote() {
 	local instance="$1" pattern="$2" extra="$3" probe="${4:-oom}"
 	local func_src remote_script call comment
 
@@ -1029,7 +1029,7 @@ _dor_run_remote() {
 		comment="scan_oom_processes $pattern"
 		;;
 	esac
-	func_src="$(_dor_probe_func_src "$probe")" || return 1
+	func_src="$(_dr_probe_func_src "$probe")" || return 1
 
 	remote_script="set -u
 ${func_src}
@@ -1045,7 +1045,7 @@ ${call}"
 # so the probe sees only this task's PID namespace. No cross-task pollution.
 #   $1 = EC2 instance id   $2 = container image ref   $3 = s3:// work directory
 #   $4 = process pattern   $5 = extra flags (e.g. --all)   $6 = probe: oom|stall
-_dor_run_in_container() {
+_dr_run_in_container() {
 	local instance="$1" image="$2" workdir="$3" pattern="$4" extra="$5" probe="${6:-stall}"
 	local tag="${image##*:}"
 	local fusion="/fusion/s3/${workdir#s3://}"
@@ -1062,7 +1062,7 @@ _dor_run_in_container() {
 		comment="oom(in-container) $tag"
 		;;
 	esac
-	func_src="$(_dor_probe_func_src "$probe")" || return 1
+	func_src="$(_dr_probe_func_src "$probe")" || return 1
 
 	# inner script runs INSIDE the container; base64 so it survives the
 	# docker-exec stdin pipe without quoting hazards (same trick as _sp_run_remote).
@@ -1107,10 +1107,10 @@ printf '%s' \"\$b64\" | base64 -d | sudo docker exec -i \"\$cid\" bash -s"
 # selected probe(s) per task INSIDE that task's own container (docker exec) --
 # falling back to a host-wide scan only when no workdir/container is known. The
 # default probe is the symptom-first stall check; callers (diagnose_oom_run)
-# override it to oom by exporting _DOR_DEFAULT_CHECK -- a variable rather than a
+# override it to oom by exporting _DR_DEFAULT_CHECK -- a variable rather than a
 # positional arg, so the list/tasks subcommands keep working.
-_dor_diagnose_tasks() {
-	local pattern="${PROC_PATTERN:-}" show_all="" probes="${_DOR_DEFAULT_CHECK:-stall}"
+_dr_diagnose_tasks() {
+	local pattern="${PROC_PATTERN:-}" show_all="" probes="${_DR_DEFAULT_CHECK:-stall}"
 	local step_filter=""
 	local -a native_ids=()
 
@@ -1224,7 +1224,7 @@ _dor_diagnose_tasks() {
 	# for the stall probe -- that each task is sampled for a churn window, so a
 	# stall scan is not instant. The effective stall pattern is the default when
 	# none was given (mirrors scan_stall_processes).
-	local _dor_stall_window=20 mode_desc disp_pattern
+	local _dr_stall_window=20 mode_desc disp_pattern
 	case "$probes" in
 	stall) mode_desc="stall (symptom-first: HUNG / crash-loop / degraded; no progress/ETA)" ;;
 	oom) mode_desc="oom (OOM-killed children left a deadlocked parent)" ;;
@@ -1242,9 +1242,9 @@ _dor_diagnose_tasks() {
 	case " $probes " in
 	*" stall "*)
 		printf '==> The stall probe samples each task for ~%ss of churn, sequentially.\n' \
-			"$_dor_stall_window" >&2
+			"$_dr_stall_window" >&2
 		printf '    Expect roughly ~%ss per task of waiting (plus SSM + docker-exec overhead).\n' \
-			"$_dor_stall_window" >&2
+			"$_dr_stall_window" >&2
 		;;
 	esac
 
@@ -1264,7 +1264,7 @@ _dor_diagnose_tasks() {
 
 	# gather input -> "<nid>\t<label>\t<workdir>\t<container>" lines.
 	#   - args: bare native IDs (no workdir/container -> host-wide fallback).
-	#   - stdin: TSV from _dor_list_running_tasks (4 fields), or a legacy
+	#   - stdin: TSV from _dr_list_running_tasks (4 fields), or a legacy
 	#     "<id> <label>" line (workdir/container empty -> host-wide fallback).
 	if [ ${#native_ids[@]} -gt 0 ]; then
 		local id
@@ -1355,7 +1355,7 @@ _dor_diagnose_tasks() {
 	case " $probes " in
 	*" stall "*)
 		printf '==> Stall sampling is sequential: budget roughly ~%ss total. Please wait.\n' \
-			"$((n_tasks * _dor_stall_window))" >&2
+			"$((n_tasks * _dr_stall_window))" >&2
 		;;
 	esac
 
@@ -1379,9 +1379,9 @@ _dor_diagnose_tasks() {
 		for pr in $probes; do
 			printf '    -- probe: %s --\n' "$pr"
 			if [ "$scoped" -eq 1 ]; then
-				out="$(_dor_run_in_container "$ec2" "$container" "$workdir" "$pattern" "$show_all" "$pr")"
+				out="$(_dr_run_in_container "$ec2" "$container" "$workdir" "$pattern" "$show_all" "$pr")"
 			else
-				out="$(_dor_run_remote "$ec2" "$pattern" "$show_all" "$pr")"
+				out="$(_dr_run_remote "$ec2" "$pattern" "$show_all" "$pr")"
 			fi
 			# each probe marks a flagged task with its own sentinel line
 			marker='STUCK pid(s):'
@@ -1433,54 +1433,54 @@ _dor_diagnose_tasks() {
 
 # --- orchestrator: list a workflow's RUNNING tasks and diagnose --------------
 # $1 = workflow id; remaining args forwarded to the diagnoser.
-_dor_diagnose_workflow() {
+_dr_diagnose_workflow() {
 	local wf="$1"
 	shift
 
 	local tasks
-	tasks="$(_dor_list_running_tasks "$wf")" || return 1
+	tasks="$(_dr_list_running_tasks "$wf")" || return 1
 	if [ -z "$tasks" ]; then
 		printf 'diagnose_oom_run: no RUNNING tasks found for workflow %s\n' "$wf" >&2
 		return 0
 	fi
 
-	printf '%s\n' "$tasks" | _dor_diagnose_tasks "$@"
+	printf '%s\n' "$tasks" | _dr_diagnose_tasks "$@"
 }
 
 # --- orchestrator: resolve a run id then diagnose ----------------------------
 # $1 = run id; remaining args forwarded to the diagnoser.
-_dor_diagnose_run_id() {
+_dr_diagnose_run_id() {
 	local run="$1"
 	shift
 
 	local wf
-	wf="$(_dor_resolve_workflow_id "$run")" || return 1
+	wf="$(_dr_resolve_workflow_id "$run")" || return 1
 	[ -z "$wf" ] && {
 		printf 'diagnose_oom_run: could not resolve a workflow ID for run %s\n' "$run" >&2
 		return 1
 	}
 
-	_dor_diagnose_workflow "$wf" "$@"
+	_dr_diagnose_workflow "$wf" "$@"
 }
 
 # =============================================================================
-# diagnose_oom_run command implementation
+# diagnose_run command implementation
 # =============================================================================
-_dor_main() {
+_dr_main() {
 	# Subcommand and help forms.
 	case "${1:-}" in
 	-h | --help | "")
-		_dor_usage
+		_dr_usage
 		[ -z "${1:-}" ] && return 2 || return 0
 		;;
 	list)
 		shift
-		_dor_list_running_tasks "$@"
+		_dr_list_running_tasks "$@"
 		return
 		;;
 	tasks)
 		shift
-		_dor_diagnose_tasks "$@"
+		_dr_diagnose_tasks "$@"
 		return
 		;;
 	esac
@@ -1527,14 +1527,14 @@ _dor_main() {
 	fi
 	if [ -z "$run_id" ] && [ -z "$wf_id" ]; then
 		printf 'diagnose_oom_run: specify --run-id ID, --workflow-id ID, or a subcommand (list|tasks)\n\n' >&2
-		_dor_usage
+		_dr_usage
 		return 2
 	fi
 
 	if [ -n "$run_id" ]; then
-		_dor_diagnose_run_id "$run_id" ${rest[@]+"${rest[@]}"}
+		_dr_diagnose_run_id "$run_id" ${rest[@]+"${rest[@]}"}
 	else
-		_dor_diagnose_workflow "$wf_id" ${rest[@]+"${rest[@]}"}
+		_dr_diagnose_workflow "$wf_id" ${rest[@]+"${rest[@]}"}
 	fi
 }
 
@@ -1605,7 +1605,7 @@ find_run_by_task_tag() {
 		printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>\n' >&2
 		return 2
 	}
-	_dor_preflight curl jq awk || return 1
+	_dr_preflight curl jq awk || return 1
 
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
 	local ep="${API_ENDPOINT%/}"
@@ -1752,15 +1752,15 @@ _xsh_main() {
 		;;
 	diagnose_run | diagnose-run)
 		shift
-		_dor_main "$@"
+		_dr_main "$@"
 		;;
 	diagnose_stall_run | diagnose-stall-run)
 		shift
-		_DOR_DEFAULT_CHECK=stall _dor_main "$@"
+		_DR_DEFAULT_CHECK=stall _dr_main "$@"
 		;;
 	diagnose_oom_run | diagnose-oom-run)
 		shift
-		_DOR_DEFAULT_CHECK=oom _dor_main "$@"
+		_DR_DEFAULT_CHECK=oom _dr_main "$@"
 		;;
 	find_run_by_task_tag | find-run-by-task-tag)
 		shift
@@ -2002,10 +2002,10 @@ EOF
 
 # --- API: resolve a task's workdir + container image by nativeId -------------
 # Emits "<workdir>\t<container-image>" on stdout; errors on stderr. Reuses the
-# same paginated /workflow/<id>/tasks endpoint as _dor_list_running_tasks.
+# same paginated /workflow/<id>/tasks endpoint as _dr_list_running_tasks.
 _sp_task_info() {
 	local wf="$1" nid="$2"
-	_dor_preflight curl jq || return 1
+	_dr_preflight curl jq || return 1
 
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
 	local ep="${API_ENDPOINT%/}"
@@ -2537,16 +2537,16 @@ USAGE
 # Public umbrella: diagnose a run/workflow/task with one or more probes, each
 # docker-exec'd INSIDE the task's own container (select with --check oom|stall|all;
 # default stall). diagnose_stall_run and diagnose_oom_run pin a single probe via
-# _DOR_DEFAULT_CHECK -- a variable, not a positional arg, so every legacy form
+# _DR_DEFAULT_CHECK -- a variable, not a positional arg, so every legacy form
 # (incl. the list/tasks subcommands) works.
 diagnose_run() {
-	_dor_main "$@"
+	_dr_main "$@"
 }
 diagnose_stall_run() {
-	_DOR_DEFAULT_CHECK=stall _dor_main "$@"
+	_DR_DEFAULT_CHECK=stall _dr_main "$@"
 }
 diagnose_oom_run() {
-	_DOR_DEFAULT_CHECK=oom _dor_main "$@"
+	_DR_DEFAULT_CHECK=oom _dr_main "$@"
 }
 
 # =============================================================================
