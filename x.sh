@@ -301,9 +301,22 @@ scan_oom_processes() {
 			cmd_match="${1#*=}"
 			shift
 			;;
+		-p | --pattern)
+			if [ -z "${2:-}" ]; then
+				echo "Error: $1 requires a PATTERN argument." >&2
+				return 2
+			fi
+			proc_pattern="$2"
+			shift 2
+			;;
+		--pattern=*)
+			proc_pattern="${1#*=}"
+			shift
+			;;
 		-h | --help)
-			echo "Usage: scan_oom_processes [--all|-a] [--match|-m TAG] PATTERN"
+			echo "Usage: scan_oom_processes [--all|-a] [--match|-m TAG] [-p|--pattern PATTERN] [PATTERN]"
 			echo "  PATTERN          'pgrep -f' pattern for the process(es) to inspect"
+			echo "                   (positional or via -p/--pattern)"
 			echo "  (default)        print only STUCK matches"
 			echo "  --all            print every match regardless of verdict"
 			echo "  --match TAG      only consider matches whose cmdline contains TAG"
@@ -315,7 +328,7 @@ scan_oom_processes() {
 			break
 			;;
 		-*)
-			echo "Unknown option: $1 (use --all, -m TAG, or -h)" >&2
+			echo "Unknown option: $1 (use --all, -m TAG, -p PATTERN, or -h)" >&2
 			return 2
 			;;
 		*)
@@ -463,14 +476,27 @@ scan_stall_processes() {
 			window="${1#*=}"
 			shift
 			;;
+		-p | --pattern)
+			[ -n "${2:-}" ] || {
+				echo "scan_stall_processes: --pattern needs a value" >&2
+				return 2
+			}
+			pattern="$2"
+			shift 2
+			;;
+		--pattern=*)
+			pattern="${1#*=}"
+			shift
+			;;
 		-a | --all)
 			show_all=1
 			shift
 			;;
 		-h | --help)
-			echo "Usage: scan_stall_processes [--window SECONDS] [--all] [PATTERN]"
+			echo "Usage: scan_stall_processes [--window SECONDS] [-p|--pattern PATTERN] [--all] [PATTERN]"
 			echo "  Fast STALL detector + cause attribution (default window 20s,"
-			echo "  default pattern 'split-pipe --mode pre')."
+			echo "  default pattern 'split-pipe --mode pre'). The pattern may be given"
+			echo "  positionally or via -p/--pattern."
 			return 0
 			;;
 		-*)
@@ -551,6 +577,21 @@ scan_stall_processes() {
 		echo
 	done | grep -oE -- '--mode[[:space:]]+[^[:space:]]+' | awk '{print $2}' | sort -u | tr '\n' ' ')
 	disp_modes=${disp_modes% }
+
+	# A broad pattern (e.g. plain 'split-pipe') can match several modes at once --
+	# typically unrelated tasks co-located on the same host. Lumping them yields a
+	# muddy verdict, so warn and tell the caller to pin a single mode.
+	local n_modes
+	n_modes=$(printf '%s' "$disp_modes" | tr ' ' '\n' | grep -c .)
+	if [ "${n_modes:-0}" -gt 1 ]; then
+		echo ">>> NOTE: pattern '$pattern' matched MULTIPLE modes: $disp_modes"
+		echo "  These are likely separate tasks sharing this host; the verdict below"
+		echo "  mixes them. Pin one mode for a clean read, e.g.:"
+		printf '%s' "$disp_modes" | tr ' ' '\n' | while IFS= read -r m; do
+			[ -z "$m" ] && continue
+			echo "    scan_stall_processes -p 'split-pipe --mode $m'"
+		done
+	fi
 
 	local f1 f2
 	f1=$(mktemp)
@@ -1074,9 +1115,14 @@ _dor_diagnose_tasks() {
 				# matched (modes) and the one-line verdict so the user can see
 				# WHICH split-pipe ran (a broad pattern may match a non-PRE stage).
 				printf '    %s: ok (no flag).\n' "$pr"
-				printf '%s\n' "$out" \
-					| grep -E '^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
-					| sed 's/^/    | /'
+				if printf '%s' "$out" | grep -q '>>> NOTE:'; then
+					# multi-mode match: show the full output incl. the narrow-down hint
+					printf '%s\n' "$out" | sed 's/^/    | /'
+				else
+					printf '%s\n' "$out" \
+						| grep -E '^Dispatcher\(s\):|^WORKING:|^ACTIVE|^IDLE/STALLED' \
+						| sed 's/^/    | /'
+				fi
 			fi
 		done
 	done 3< <(cut -f1 "$mapf" | sort -u)
