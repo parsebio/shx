@@ -777,7 +777,7 @@ scan_stall_processes() {
 		}
 		# cause line, printed under every FLAGGED verdict
 		if (OOMKILL+0 > 0)
-			cause = sprintf("  Likely cause: OOM -- cgroup memory.events oom_kill=%s (memory.max=%s, memory.current=%s).\n  -> fix: raise the PRE-stage memory or shrink chunk size, not just restart.", OOMKILL, OOMMAX, OOMCUR)
+			cause = sprintf("  Likely cause: OOM -- cgroup memory.events oom_kill=%s (memory.max=%s, memory.current=%s).", OOMKILL, OOMMAX, OOMCUR)
 		else
 			cause = "  Cause: not OOM (oom_kill=0). Check `dmesg` for a segfault and the task log for a\n  Python traceback -- the worker(s) died some other way."
 
