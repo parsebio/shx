@@ -227,6 +227,40 @@ _oom_evidence() {
 }
 
 # =============================================================================
+# Shared: suggest a pattern when the requested one matched nothing
+# -----------------------------------------------------------------------------
+# Called from a probe's no-match branch (on the remote host). The user asked for
+# a pattern that has no live processes; the most useful next thing is "here is
+# what 'split-pipe' IS running right now, and how to target it". Distils the
+# running command lines down to their `--mode <X>` (the canonical pattern axis),
+# falling back to the trimmed command lines when no `--mode` is present.
+# Shipped to remote hosts alongside the probes via `declare -f`, so it must stay
+# self-contained.
+# =============================================================================
+_suggest_split_pipe_patterns() {
+	local running modes
+	running=$(pgrep -af 'split-pipe' 2>/dev/null | sed -E 's/^[0-9]+[[:space:]]+//')
+	if [ -z "$running" ]; then
+		echo "  No 'split-pipe' processes are running on this host either."
+		return 0
+	fi
+	echo "  But 'split-pipe' IS running here. Currently running mode(s):"
+	modes=$(printf '%s\n' "$running" | grep -oE -- '--mode[[:space:]]+[^[:space:]]+' \
+		| awk '{print $2}' | sort -u)
+	if [ -n "$modes" ]; then
+		local m
+		printf '%s\n' "$modes" | while IFS= read -r m; do
+			[ -z "$m" ] && continue
+			printf "    - 'split-pipe --mode %s'\n" "$m"
+		done
+		echo "  Re-run with  -p/--pattern 'split-pipe --mode <mode>'  to target one of these."
+	else
+		printf '%s\n' "$running" | sort -u | sed 's/^/    - /'
+		echo "  Re-run with  -p/--pattern '<command substring>'  to target one of these."
+	fi
+}
+
+# =============================================================================
 # Public: on-host OOM-stuck process finder (run this ON the host)
 # -----------------------------------------------------------------------------
 # Find processes that are hung because the kernel OOM-killed some of their
@@ -304,9 +338,10 @@ scan_oom_processes() {
 	pids=$(pgrep -f "$proc_pattern" 2>/dev/null)
 
 	if [ -z "$pids" ]; then
-		echo "No processes matching '$proc_pattern' found on this host."
-		echo "If you expected one, confirm you are on the right host and that the"
-		echo "process is still running."
+		echo ">>> NO-MATCH: no process matches the pattern: $proc_pattern"
+		echo "  If you expected one, confirm you are on the right host and that the"
+		echo "  process is still running."
+		_suggest_split_pipe_patterns
 		return 0
 	fi
 
@@ -503,7 +538,8 @@ scan_stall_processes() {
 	disp_list=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
 	disp_list=${disp_list% }
 	if [ -z "$disp_list" ]; then
-		echo "No processes match: $pattern"
+		echo ">>> NO-MATCH: no process matches the pattern: $pattern"
+		_suggest_split_pipe_patterns
 		return 0
 	fi
 
@@ -791,12 +827,12 @@ _dor_run_remote() {
 		# The stall probe has its own sensible default pattern (the PRE
 		# dispatcher), so an empty pattern is fine here.
 		[ -n "$pattern" ] || pattern='split-pipe --mode pre'
-		func_src="$(declare -f scan_stall_processes _oom_evidence)" || return 1
+		func_src="$(declare -f scan_stall_processes _oom_evidence _suggest_split_pipe_patterns)" || return 1
 		call="scan_stall_processes ${extra} $(printf '%q' "$pattern")"
 		comment="scan_stall_processes $pattern"
 		;;
 	oom | *)
-		func_src="$(declare -f scan_oom_processes _oom_evidence)" || return 1
+		func_src="$(declare -f scan_oom_processes _oom_evidence _suggest_split_pipe_patterns)" || return 1
 		call="scan_oom_processes ${extra} $(printf '%q' "$pattern")"
 		comment="scan_oom_processes $pattern"
 		;;
@@ -906,6 +942,32 @@ _dor_diagnose_tasks() {
 		esac
 	done
 
+	# --- announce what we are about to do ------------------------------------
+	# The user should know up front: which probe (mode), which process pattern
+	# it greps for, and -- for the stall probe -- that each instance is sampled
+	# for a churn window, so a stall scan is not instant. The effective stall
+	# pattern is the default when none was given (mirrors scan_stall_processes).
+	local _dor_stall_window=20 mode_desc disp_pattern
+	case "$probes" in
+	stall) mode_desc="stall (symptom-first: HUNG / crash-loop / degraded; no progress/ETA)" ;;
+	oom) mode_desc="oom (OOM-killed children left a deadlocked parent)" ;;
+	*) mode_desc="all (oom + stall)" ;;
+	esac
+	disp_pattern="$pattern"
+	if [ -z "$disp_pattern" ]; then
+		disp_pattern="split-pipe --mode pre  (stall default)"
+	fi
+	printf '==> Mode (--check): %s\n' "$mode_desc" >&2
+	printf '==> Process pattern (--pattern): %s\n' "$disp_pattern" >&2
+	case " $probes " in
+	*" stall "*)
+		printf '==> The stall probe samples each instance for ~%ss of churn, sequentially.\n' \
+			"$_dor_stall_window" >&2
+		printf '    Expect roughly ~%ss per instance of waiting (plus SSM overhead).\n' \
+			"$_dor_stall_window" >&2
+		;;
+	esac
+
 	# temp files: input lines, queue->cluster cache, instance->label map
 	local intasks qcache mapf
 	intasks="$(mktemp)"
@@ -967,6 +1029,12 @@ _dor_diagnose_tasks() {
 		return 1
 	}
 	printf '==> %s unique instance(s) to check.\n' "$n_inst" >&2
+	case " $probes " in
+	*" stall "*)
+		printf '==> Stall sampling is sequential: budget roughly ~%ss total. Please wait.\n' \
+			"$((n_inst * _dor_stall_window))" >&2
+		;;
+	esac
 
 	# diagnose each unique instance, running each selected probe on it
 	local stuck_list="" instance out pr marker
@@ -984,6 +1052,11 @@ _dor_diagnose_tasks() {
 			[ "$pr" = stall ] && marker='>>> FLAG'
 			if printf '%s' "$out" | grep -q "$marker"; then
 				stuck_list="${stuck_list}${instance}"$'\t'"${pr}"$'\n'
+				printf '%s\n' "$out" | sed 's/^/    | /'
+			elif printf '%s' "$out" | grep -q '>>> NO-MATCH'; then
+				# The pattern matched no process here -- always surface this
+				# (and any "what IS running" suggestion) rather than report "ok".
+				printf '    %s: pattern not found on this host.\n' "$pr"
 				printf '%s\n' "$out" | sed 's/^/    | /'
 			elif [ -n "$show_all" ]; then
 				printf '%s\n' "$out" | sed 's/^/    | /'
