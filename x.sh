@@ -24,6 +24,13 @@
 #   API_ENDPOINT       API base URL.
 #   PROC_PATTERN       Default remote process pattern for diagnosis.
 #
+# Optional environment:
+#   AWS_PROFILE        AWS CLI profile used by every aws call (the CLI reads it
+#                      natively). `x.sh --aws-profile NAME <command>`, or
+#                      `--aws-profile NAME` passed to an AWS-using command
+#                      itself (open_task_shell, diagnose_*run,
+#                      show_task_star_progress), sets it for that one invocation.
+#
 # Requirements: awscli v2 configured for the target account/region; the SSM
 # Session Manager plugin (for open_task_shell); jq, curl, awk.
 # =============================================================================
@@ -32,40 +39,137 @@
 # Shared AWS helper -- the single Batch->ECS->EC2 trace
 # =============================================================================
 
-# Trace a Batch job ID to its underlying EC2 instance ID. Quiet: prints the EC2
-# instance id on stdout, or returns 1 if any hop cannot be resolved.
+# printf-style error message to stderr, in red when stderr is a terminal (and
+# NO_COLOR is unset). A message captured to a file stays plain, so callers that
+# capture one and re-print it should re-print it with this too.
+#   $1 = printf format (no trailing newline)   $2... = its arguments
+_xsh_err() {
+	local fmt="$1"
+	shift
+	if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+		# shellcheck disable=SC2059 # caller-supplied format, by design
+		printf "\033[31m$fmt\033[0m\n" "$@" >&2
+	else
+		# shellcheck disable=SC2059
+		printf "$fmt\n" "$@" >&2
+	fi
+}
+
+# Validate an AWS CLI profile name given via --aws-profile. Callers then scope
+# it with `local -x AWS_PROFILE="$name"`: exported to child aws processes,
+# restored on return, so a sourcing shell's own AWS_PROFILE is left untouched.
+# (This can't be done here -- a `local` only lives as long as the function
+# declaring it.) Fails fast on a typo'd profile: several aws calls discard
+# stderr, so the CLI's own "profile not found" error would otherwise be
+# swallowed.
+#   $1 = profile name   $2 = caller name for error messages
+_xsh_check_profile() {
+	local profile="$1" who="${2:-x.sh}"
+	[ -n "$profile" ] || {
+		_xsh_err '%s: --aws-profile requires a profile name' "$who"
+		return 2
+	}
+	if command -v aws >/dev/null 2>&1 &&
+		! aws configure list-profiles 2>/dev/null | grep -qxF -- "$profile"; then
+		_xsh_err '%s: AWS profile not found: %s' "$who" "$profile"
+		return 2
+	fi
+}
+
+# Fail fast when no AWS region is configured: otherwise every aws call fails
+# with "You must specify a region" (Batch/ECS/SSM are all regional). Same
+# lookup order as the CLI: AWS_REGION, AWS_DEFAULT_REGION, then the active
+# profile's config (`aws configure get` ignores the env vars, hence checking
+# them first).
+#   $1 = caller name for error messages
+_xsh_require_aws_region() {
+	local who="${1:-x.sh}"
+	[ -n "${AWS_REGION:-}" ] || [ -n "${AWS_DEFAULT_REGION:-}" ] && return 0
+	[ -n "$(aws configure get region 2>/dev/null </dev/null)" ] && return 0
+	_xsh_err '%s: no AWS region set for profile %s -- run `aws configure set region <region> --profile %s` or export AWS_REGION' \
+		"$who" "${AWS_PROFILE:-default}" "${AWS_PROFILE:-default}"
+	return 2
+}
+
+# Run one aws query, printing its --output text result on stdout. On failure
+# prints a one-line reason ("<step>: <condensed aws error>") on stderr and
+# returns 1. AccessDenied errors are shortened to the IAM action that is
+# missing; anything else keeps the CLI's last error line.
+#   $1 = step label for the reason   $2... = aws arguments
+_xsh_aws_query() {
+	local step="$1" errf out err rc action
+	shift
+	errf="$(mktemp)"
+	out="$(aws "$@" 2>"$errf" </dev/null)"
+	rc=$?
+	err="$(grep -v '^[[:space:]]*$' "$errf" | tail -n 1)"
+	rm -f "$errf"
+	if [ "$rc" -eq 0 ]; then
+		printf '%s\n' "$out"
+		return 0
+	fi
+	case "$err" in
+	*AccessDenied* | *UnauthorizedOperation* | *"not authorized to perform"*)
+		action="$(printf '%s\n' "$err" | sed -n 's/.*not authorized to perform: \([^ ]*\).*/\1/p')"
+		_xsh_err '%s: AccessDenied -- the AWS role lacks %s' "$step" "${action:-the permission}"
+		;;
+	*) _xsh_err '%s: %s' "$step" "${err:-aws exited with status $rc}" ;;
+	esac
+	return 1
+}
+
+# Trace a Batch job ID to its underlying EC2 instance ID. Prints the EC2
+# instance id on stdout; if any hop cannot be resolved, returns 1 with a
+# one-line reason on stderr (which step failed and why).
 #   $1 = Batch job id
 #   $2 = (optional) queue->cluster TSV cache file to skip repeat lookups
 _aws_batch_job_to_ec2() {
 	local job_id="$1" qcache="${2:-}"
-	local ci_arn q ce cluster ec2
+	local job job_status q ci_arn ce cluster ec2 region
 
-	ci_arn="$(aws batch describe-jobs --jobs "$job_id" \
-		--query 'jobs[0].container.containerInstanceArn' --output text 2>/dev/null </dev/null)"
-	[ -z "$ci_arn" ] || [ "$ci_arn" = "None" ] && return 1
-
-	q="$(aws batch describe-jobs --jobs "$job_id" \
-		--query 'jobs[0].jobQueue' --output text 2>/dev/null </dev/null)"
-	[ -z "$q" ] || [ "$q" = "None" ] && return 1
+	job="$(_xsh_aws_query "batch describe-jobs" batch describe-jobs --jobs "$job_id" \
+		--query 'jobs[0].[status,jobQueue,container.containerInstanceArn]' --output text)" || return 1
+	IFS=$'\t' read -r job_status q ci_arn <<<"$job"
+	if [ -z "$job_status" ] || [ "$job_status" = "None" ]; then
+		region="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null </dev/null)}}"
+		_xsh_err 'batch describe-jobs: no such job (profile %s, region %s) -- wrong account or region?' \
+			"${AWS_PROFILE:-default}" "$region"
+		return 1
+	fi
+	if [ -z "$ci_arn" ] || [ "$ci_arn" = "None" ]; then
+		_xsh_err 'batch describe-jobs: job is %s and has no container instance (not started yet, or ended)' "$job_status"
+		return 1
+	fi
 
 	# Reuse a cached queue->cluster mapping when a cache file is provided.
 	cluster=""
 	[ -n "$qcache" ] && cluster="$(awk -F'\t' -v k="$q" '$1==k{print $2; exit}' "$qcache" 2>/dev/null)"
 	if [ -z "$cluster" ]; then
-		ce="$(aws batch describe-job-queues --job-queues "$q" \
+		ce="$(_xsh_aws_query "batch describe-job-queues" batch describe-job-queues --job-queues "$q" \
 			--query 'jobQueues[0].computeEnvironmentOrder[0].computeEnvironment' \
-			--output text 2>/dev/null </dev/null)"
-		[ -z "$ce" ] || [ "$ce" = "None" ] && return 1
-		cluster="$(aws batch describe-compute-environments --compute-environments "$ce" \
-			--query 'computeEnvironments[0].ecsClusterArn' --output text 2>/dev/null </dev/null)"
-		[ -z "$cluster" ] || [ "$cluster" = "None" ] && return 1
+			--output text)" || return 1
+		[ -z "$ce" ] || [ "$ce" = "None" ] && {
+			_xsh_err 'batch describe-job-queues: no compute environment for queue %s' "$q"
+			return 1
+		}
+		cluster="$(_xsh_aws_query "batch describe-compute-environments" \
+			batch describe-compute-environments --compute-environments "$ce" \
+			--query 'computeEnvironments[0].ecsClusterArn' --output text)" || return 1
+		[ -z "$cluster" ] || [ "$cluster" = "None" ] && {
+			_xsh_err 'batch describe-compute-environments: no ECS cluster for %s' "$ce"
+			return 1
+		}
 		[ -n "$qcache" ] && printf '%s\t%s\n' "$q" "$cluster" >>"$qcache"
 	fi
 
-	ec2="$(aws ecs describe-container-instances --cluster "$cluster" \
+	ec2="$(_xsh_aws_query "ecs describe-container-instances" \
+		ecs describe-container-instances --cluster "$cluster" \
 		--container-instances "$ci_arn" \
-		--query 'containerInstances[0].ec2InstanceId' --output text 2>/dev/null </dev/null)"
-	[ -z "$ec2" ] || [ "$ec2" = "None" ] && return 1
+		--query 'containerInstances[0].ec2InstanceId' --output text)" || return 1
+	[ -z "$ec2" ] || [ "$ec2" = "None" ] && {
+		_xsh_err 'ecs describe-container-instances: container instance is gone (job %s; instance terminated?)' "$job_status"
+		return 1
+	}
 	printf '%s\n' "$ec2"
 }
 
@@ -131,17 +235,19 @@ _xsh_ssm_run() {
 open_task_shell() {
 	local usage
 	read -r -d '' usage <<'EOF' || true
-Usage: open_task_shell [-h|--help] <job_id>
+Usage: open_task_shell [--aws-profile NAME] [-h|--help] <job_id>
 
 Trace a task's Native ID to its underlying EC2 instance and open
 an SSM Session Manager session on it.
 
 Arguments:
-  job_id        Batch job ID (AWS Batch executor)
-                e.g. aa00a1e2-1e96-4cbb-a670-3b33c5ac356d
+  job_id              Batch job ID (AWS Batch executor)
+                      e.g. aa00a1e2-1e96-4cbb-a670-3b33c5ac356d
 
 Options:
-  -h, --help    Show this help message and exit.
+  --aws-profile NAME  AWS CLI profile to use
+                      (default: $AWS_PROFILE / CLI default).
+  -h, --help          Show this help message and exit.
 
 Requirements:
   - awscli (v2) configured with credentials for the target account/region.
@@ -155,12 +261,19 @@ Example:
 EOF
 
 	# --- Parse arguments ------------------------------------------------------
-	local job_id=""
+	local job_id="" profile="" profile_set=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		-h | --help)
 			printf '%s\n' "$usage"
 			return 0
+			;;
+		--aws-profile)
+			profile="${2:-}" profile_set=1
+			[ $# -ge 2 ] && shift
+			;;
+		--aws-profile=*)
+			profile="${1#*=}" profile_set=1
 			;;
 		-*)
 			printf 'Error: unknown option %s\n\n' "$1" >&2
@@ -184,12 +297,17 @@ EOF
 		printf '%s\n' "$usage" >&2
 		return 1
 	fi
+	if [ "$profile_set" -eq 1 ]; then
+		_xsh_check_profile "$profile" open_task_shell || return 2
+		local -x AWS_PROFILE="$profile"
+	fi
+	_xsh_require_aws_region open_task_shell || return 2
 
 	# --- Trace + connect (trace logic shared via _aws_batch_job_to_ec2) -------
 	printf '==> Tracing Batch job %s to its EC2 instance...\n' "$job_id"
 	local ec2_instance_id
 	ec2_instance_id="$(_aws_batch_job_to_ec2 "$job_id")" || {
-		printf 'Error: could not trace Batch job %s to an EC2 instance.\n' "$job_id" >&2
+		_xsh_err 'Error: could not trace Batch job %s to an EC2 instance.' "$job_id"
 		return 1
 	}
 	printf '    EC2 instance: %s\n' "$ec2_instance_id"
@@ -856,6 +974,10 @@ so co-located tasks on the same instance never pollute one another's result. Bar
 native IDs (the 'tasks' subcommand with no workdir/container) fall back to a
 host-wide scan and are labelled as such.
 
+Global option (any position, any form above):
+  --aws-profile NAME           AWS CLI profile to use (default: $AWS_PROFILE /
+                                 the CLI default)
+
 diagnose-args forwarded to the task diagnoser:
   -c, --check oom|stall|all    probe(s) to run (default stall):
                                  stall -> scan_stall_processes (no progress; HUNG /
@@ -1272,17 +1394,18 @@ _dr_diagnose_tasks() {
 	esac
 
 	# temp files: normalised input lines, queue->cluster cache, resolved worklist
-	local intasks qcache worklist
+	local intasks qcache worklist traceerr
 	intasks="$(mktemp)"
 	qcache="$(mktemp)"
 	worklist="$(mktemp)"
+	traceerr="$(mktemp)"
 	# Clean up temp files when this function returns. bash uses the RETURN
 	# pseudo-signal; zsh has no RETURN trap, but an EXIT trap set inside a
 	# function is function-local there and fires on return -- so pick per shell.
 	if [ -n "${ZSH_VERSION:-}" ]; then
-		trap 'rm -f "$intasks" "$qcache" "$worklist"' EXIT
+		trap 'rm -f "$intasks" "$qcache" "$worklist" "$traceerr"' EXIT
 	else
-		trap 'rm -f "$intasks" "$qcache" "$worklist"' RETURN
+		trap 'rm -f "$intasks" "$qcache" "$worklist" "$traceerr"' RETURN
 	fi
 
 	# gather input -> "<nid>\t<label>\t<workdir>\t<container>" lines.
@@ -1354,9 +1477,10 @@ _dr_diagnose_tasks() {
 	while IFS=$'\t' read -r nid lbl workdir container <&3; do
 		[ -z "$nid" ] && continue
 		done_n=$((done_n + 1))
-		ec2="$(_aws_batch_job_to_ec2 "$nid" "$qcache")"
+		ec2="$(_aws_batch_job_to_ec2 "$nid" "$qcache" 2>"$traceerr")"
 		if [ -z "$ec2" ]; then
-			printf '    [%s/%s] %s -> (unresolved; job may have ended)\n' "$done_n" "$n_in" "$nid" >&2
+			_xsh_err '    [%s/%s] %s -> unresolved: %s' "$done_n" "$n_in" "$nid" \
+				"$(cat "$traceerr")"
 			continue
 		fi
 		if [ -n "$workdir" ] && [ -n "$container" ]; then
@@ -1493,6 +1617,29 @@ _dr_diagnose_run_id() {
 # diagnose_run command implementation
 # =============================================================================
 _dr_main() {
+	# --aws-profile is accepted anywhere (before or after a subcommand), so pull
+	# it out before any other parsing sees it.
+	local profile="" profile_set=0
+	local -a args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--aws-profile)
+			profile="${2:-}" profile_set=1
+			[ $# -ge 2 ] && shift
+			;;
+		--aws-profile=*)
+			profile="${1#*=}" profile_set=1
+			;;
+		*) args+=("$1") ;;
+		esac
+		shift
+	done
+	set -- ${args[@]+"${args[@]}"}
+	if [ "$profile_set" -eq 1 ]; then
+		_xsh_check_profile "$profile" diagnose_run || return 2
+		local -x AWS_PROFILE="$profile"
+	fi
+
 	# Subcommand and help forms.
 	case "${1:-}" in
 	-h | --help | "")
@@ -1506,6 +1653,7 @@ _dr_main() {
 		;;
 	tasks)
 		shift
+		_xsh_require_aws_region diagnose_run || return 2
 		_dr_diagnose_tasks "$@"
 		return
 		;;
@@ -1556,6 +1704,7 @@ _dr_main() {
 		_dr_usage
 		return 2
 	fi
+	_xsh_require_aws_region diagnose_run || return 2
 
 	if [ -n "$run_id" ]; then
 		_dr_diagnose_run_id "$run_id" ${rest[@]+"${rest[@]}"}
@@ -1707,7 +1856,15 @@ find_run_by_task_tag() {
 _xsh_usage() {
 	cat <<'EOF'
 Usage:
-  x.sh <command> [args...]
+  x.sh [--aws-profile NAME] <command> [args...]
+
+Global options:
+  --aws-profile NAME
+      AWS CLI profile for every aws call made by the command (exported as
+      AWS_PROFILE for this invocation only). Without it, an AWS_PROFILE already
+      in the environment, or the CLI's default profile, is used. The commands
+      that call AWS (open_task_shell, diagnose_*run, show_task_star_progress)
+      also accept --aws-profile themselves, e.g. when the file is sourced.
 
 Commands:
   open_task_shell <job_id>
@@ -1757,6 +1914,27 @@ EOF
 }
 
 _xsh_main() {
+	local profile="" profile_set=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--aws-profile)
+			profile="${2:-}" profile_set=1
+			[ $# -ge 2 ] && shift
+			;;
+		--aws-profile=*)
+			profile="${1#*=}" profile_set=1
+			;;
+		*) break ;;
+		esac
+		shift
+	done
+
+	if [ "$profile_set" -eq 1 ]; then
+		_xsh_check_profile "$profile" || return 2
+		local -x AWS_PROFILE="$profile"
+	fi
+
 	local entrypoint="${1:-}"
 
 	case "$entrypoint" in
@@ -2156,7 +2334,7 @@ printf '%s' \"\$b64\" | base64 -d | sudo docker exec -i \"\$cid\" bash -s"
 show_task_star_progress() {
 	local usage
 	read -r -d '' usage <<'EOF' || true
-Usage: show_task_star_progress --workflow-id <id> --native-id <nativeId>
+Usage: show_task_star_progress [--aws-profile NAME] --workflow-id <id> --native-id <nativeId>
 
 Resolve a STAR alignment task's work directory and container image via the
 Tower API, trace its nativeId to the backing EC2 instance, find the running task
@@ -2166,6 +2344,7 @@ FASTQ and Log.progress.out.
 Options:
   --workflow-id <id>   Tower workflow ID that owns the task.
   --native-id <id>     Task nativeId (AWS Batch job UUID).
+  --aws-profile NAME   AWS CLI profile to use (default: $AWS_PROFILE / CLI default).
   -h, --help           Show this help message and exit.
 
 Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
@@ -2177,7 +2356,7 @@ Example:
     --native-id aa00a1e2-1e96-4cbb-a670-3b33c5ac356d
 EOF
 
-	local wf="" nid=""
+	local wf="" nid="" profile="" profile_set=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--workflow-id)
@@ -2202,6 +2381,15 @@ EOF
 			;;
 		--native-id=*)
 			nid="${1#*=}"
+			shift
+			;;
+		--aws-profile)
+			profile="${2:-}" profile_set=1
+			[ $# -ge 2 ] && shift
+			shift
+			;;
+		--aws-profile=*)
+			profile="${1#*=}" profile_set=1
 			shift
 			;;
 		-h | --help)
@@ -2235,6 +2423,11 @@ EOF
 		printf 'show_task_star_progress: required command not found: aws\n' >&2
 		return 1
 	}
+	if [ "$profile_set" -eq 1 ]; then
+		_xsh_check_profile "$profile" show_task_star_progress || return 2
+		local -x AWS_PROFILE="$profile"
+	fi
+	_xsh_require_aws_region show_task_star_progress || return 2
 
 	printf '==> Resolving work directory + container image for task %s in workflow %s...\n' "$nid" "$wf" >&2
 	local info workdir image
@@ -2252,7 +2445,7 @@ EOF
 	printf '==> Tracing nativeId %s to its EC2 instance...\n' "$nid" >&2
 	local ec2
 	ec2="$(_aws_batch_job_to_ec2 "$nid")" || {
-		printf 'show_task_star_progress: could not trace nativeId %s to an EC2 instance.\n' "$nid" >&2
+		_xsh_err 'show_task_star_progress: could not trace nativeId %s to an EC2 instance.' "$nid"
 		return 1
 	}
 	printf '    EC2 instance: %s\n' "$ec2" >&2
