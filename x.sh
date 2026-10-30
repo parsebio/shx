@@ -18,13 +18,19 @@
 # via `declare -f`, then docker-exec'd INSIDE each task's own container over SSM
 # so the scan sees only that task's PID namespace.
 #
-# Required environment:
+# Required environment (Seqera runs only; self-hosted runs need just AWS access):
 #   API_ACCESS_TOKEN   Personal access token (Authorization: Bearer ...).
 #   WORKSPACE_ID       Numeric workspace ID.
 #   API_ENDPOINT       API base URL.
 #   PROC_PATTERN       Default remote process pattern for diagnosis.
 #
 # Optional environment:
+#   NF_SECONDARY_ENV   Environment of the self-hosted Batch queues
+#                      (nf-secondary-*-<env>; default production).
+#   XSH_SOURCE         seqera | selfhosted: where runs are looked up. Same as
+#                      --source. By default a workflow id's format decides
+#                      (UUID = self-hosted head job), and a run name goes to
+#                      Seqera when API_* is set, else to the self-hosted queues.
 #   AWS_PROFILE        AWS CLI profile used by every aws call (the CLI reads it
 #                      natively). `x.sh --aws-profile NAME <command>`, or
 #                      `--aws-profile NAME` passed to an AWS-using command
@@ -227,6 +233,101 @@ _xsh_ssm_run() {
 		printf '%s\n' "$err" >&2
 	fi
 	[ "$inv_status" = "Success" ]
+}
+
+# =============================================================================
+# Shared: self-hosted runs (Nextflow on our own AWS Batch queues, no Seqera)
+# -----------------------------------------------------------------------------
+# A self-hosted run's workflow id is its head job's Batch job id (a UUID);
+# Seqera workflow ids are 14-character base62. The head job runs on
+# nf-secondary-head-<env> named run-<secondaryAnalysisId>; its tasks run on the
+# nf-secondary-work*-<env> queues, tagged workflowId and runName. <env> is
+# NF_SECONDARY_ENV (default production). Tasks work in a /tmp/nxf.* scratch dir
+# instead of a /fusion/s3 mount.
+# =============================================================================
+
+_xsh_is_selfhosted_id() {
+	printf '%s' "$1" | grep -Eqi '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
+# Prints seqera or selfhosted: XSH_SOURCE (--source) wins, then the workflow
+# id's format, then Seqera when any of its API_* environment is set (so a
+# missing one is reported rather than silently switching runner).
+#   $1 = (optional) workflow id
+_xsh_source() {
+	if [ -n "${XSH_SOURCE:-}" ]; then
+		printf '%s\n' "$XSH_SOURCE"
+	elif [ -n "${1:-}" ]; then
+		if _xsh_is_selfhosted_id "$1"; then printf 'selfhosted\n'; else printf 'seqera\n'; fi
+	elif [ -n "${API_ACCESS_TOKEN:-}${WORKSPACE_ID:-}${API_ENDPOINT:-}" ]; then
+		printf 'seqera\n'
+	else
+		printf 'selfhosted\n'
+	fi
+}
+
+# Validate a --source value.   $1 = value   $2 = caller name for error messages
+_xsh_check_source() {
+	case "$1" in
+	seqera | selfhosted) return 0 ;;
+	esac
+	_xsh_err '%s: --source must be seqera or selfhosted' "${2:-x.sh}"
+	return 2
+}
+
+# Describe Batch jobs, one TSV row each:
+#   "<jobId>\t<jobName>\t<status>\t<workflowId>\t<runName>\t<workdir>\t<image>"
+# The work dir is read from the job command, which fetches <workdir>/.command.run.
+#   $@ = Batch job ids (any number; described 100 at a time)
+_xsh_selfhosted_describe_jobs() {
+	local -a chunk=()
+	local id
+	for id in "$@" ""; do
+		[ -n "$id" ] && chunk+=("$id")
+		if [ "${#chunk[@]}" -eq 100 ] || { [ -z "$id" ] && [ "${#chunk[@]}" -gt 0 ]; }; then
+			_xsh_aws_query "batch describe-jobs" batch describe-jobs --jobs "${chunk[@]}" \
+				--query 'jobs[].[jobId,jobName,status,tags.workflowId,tags.runName,container.image,join(`" "`,container.command)]' \
+				--output text || return 1
+			chunk=()
+		fi
+	done | awk -F'\t' 'BEGIN { OFS = "\t" } {
+		workdir = ""
+		if (match($7, /s3:\/\/[^ ]*\/\.command\.run/)) workdir = substr($7, RSTART, RLENGTH - length("/.command.run"))
+		print $1, $2, $3, $4, $5, workdir, $6
+	}'
+}
+
+# Every task job in the work queues with one of the given Batch statuses, in
+# the _xsh_selfhosted_describe_jobs row shape.
+#   $1 = space-separated Batch job statuses, e.g. "RUNNING"
+_xsh_selfhosted_task_jobs() {
+	local env="${NF_SECONDARY_ENV:-production}" q st ids
+	local -a all_ids=()
+	for q in "nf-secondary-work-$env" "nf-secondary-work-largedisk-$env" "nf-secondary-work-ondemand-$env"; do
+		for st in $1; do
+			ids="$(_xsh_aws_query "batch list-jobs $q" batch list-jobs --job-queue "$q" --job-status "$st" \
+				--query 'jobSummaryList[].jobId' --output text)" || return 1
+			# shellcheck disable=SC2206 # ids are whitespace-separated UUIDs
+			[ -n "$ids" ] && [ "$ids" != "None" ] && all_ids+=($ids)
+		done
+	done
+	[ "${#all_ids[@]}" -eq 0 ] && return 0
+	_xsh_selfhosted_describe_jobs "${all_ids[@]}"
+}
+
+# "sample=<tag> step=<process>" for a self-hosted task, read from the
+# "### name: 'WT:ALIGN (S1)'" header of its .command.run; falls back to the Batch
+# job name (the task name with ':' and spaces squashed) when that can't be read.
+#   $1 = s3:// work directory   $2 = Batch job name
+_xsh_selfhosted_task_label() {
+	local name=""
+	[ -n "$1" ] && name="$(aws s3 cp --only-show-errors "$1/.command.run" - 2>/dev/null </dev/null |
+		awk "/^### name: '/ { sub(/^### name: '/, \"\"); sub(/'\$/, \"\"); print; exit }")"
+	printf '%s\n' "${name:-$2}" | awk '{
+		i = index($0, " (")
+		if (i > 0 && substr($0, length($0)) == ")") printf "sample=%s step=%s\n", substr($0, i + 2, length($0) - i - 2), substr($0, 1, i - 1)
+		else printf "sample= step=%s\n", $0
+	}'
 }
 
 # =============================================================================
@@ -943,11 +1044,15 @@ scan_stall_processes() {
 # =============================================================================
 
 # --- private: fail-fast preflight (env + required commands) ------------------
+#   $1 = source (seqera | selfhosted; only Seqera needs API_*)   $2... = commands
 _dr_preflight() {
-	local missing="" cmd
-	[ -z "${API_ACCESS_TOKEN:-}" ] && missing="$missing API_ACCESS_TOKEN"
-	[ -z "${WORKSPACE_ID:-}" ] && missing="$missing WORKSPACE_ID"
-	[ -z "${API_ENDPOINT:-}" ] && missing="$missing API_ENDPOINT"
+	local source="$1" missing="" cmd
+	shift
+	if [ "$source" = seqera ]; then
+		[ -z "${API_ACCESS_TOKEN:-}" ] && missing="$missing API_ACCESS_TOKEN"
+		[ -z "${WORKSPACE_ID:-}" ] && missing="$missing WORKSPACE_ID"
+		[ -z "${API_ENDPOINT:-}" ] && missing="$missing API_ENDPOINT"
+	fi
 	if [ -n "$missing" ]; then
 		printf 'diagnose_oom_run: missing required environment variable(s):%s\n' "$missing" >&2
 		return 1
@@ -974,9 +1079,13 @@ so co-located tasks on the same instance never pollute one another's result. Bar
 native IDs (the 'tasks' subcommand with no workdir/container) fall back to a
 host-wide scan and are labelled as such.
 
-Global option (any position, any form above):
+Global options (any position, any form above):
   --aws-profile NAME           AWS CLI profile to use (default: $AWS_PROFILE /
                                  the CLI default)
+  --source seqera|selfhosted   where to look runs up (default: a workflow id's
+                                 format decides -- a UUID is a self-hosted head
+                                 job; a run id goes to Seqera when API_* is set,
+                                 else to the self-hosted Batch queues)
 
 diagnose-args forwarded to the task diagnoser:
   -c, --check oom|stall|all    probe(s) to run (default stall):
@@ -992,7 +1101,11 @@ diagnose-args forwarded to the task diagnoser:
 
 Aliases: diagnose_stall_run pins --check stall; diagnose_oom_run pins --check oom.
 
-Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
+Required environment for Seqera runs: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT.
+Self-hosted runs are read from AWS Batch (queues nf-secondary-*-$NF_SECONDARY_ENV,
+default production); --run-id takes run-<secondaryAnalysisId> or the bare id.
+Each self-hosted task also shows its instance's Mountpoint (S3 mount) warnings and
+errors from the last hour, read from CloudWatch: the replacement for .fusion.log.
 EOF
 }
 
@@ -1003,23 +1116,28 @@ _dr_resolve_workflow_id() {
 		printf 'diagnose_oom_run: --run-id requires a value\n' >&2
 		return 2
 	}
-	_dr_preflight curl jq awk || return 1
-
 	local run="$1"
-	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
-	local ep="${API_ENDPOINT%/}"
-
 	local rows
-	rows="$(curl -fsSL --get "${auth[@]}" \
-		--data-urlencode "search=$run" \
-		--data-urlencode "max=50" \
-		--data-urlencode "workspaceId=$WORKSPACE_ID" \
-		"$ep/workflow")" || {
-		printf 'diagnose_oom_run: API request failed while searching for run %s\n' "$run" >&2
-		return 1
-	}
+	if [ "$(_xsh_source)" = selfhosted ]; then
+		_dr_preflight selfhosted aws awk || return 1
+		rows="$(_dr_selfhosted_head_jobs "$run")" || return 1
+	else
+		_dr_preflight seqera curl jq awk || return 1
 
-	rows="$(jq -r '.workflows[].workflow | "\(.id)\t\(.runName)\t\(.status)"' <<<"$rows")"
+		local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
+		local ep="${API_ENDPOINT%/}"
+
+		rows="$(curl -fsSL --get "${auth[@]}" \
+			--data-urlencode "search=$run" \
+			--data-urlencode "max=50" \
+			--data-urlencode "workspaceId=$WORKSPACE_ID" \
+			"$ep/workflow")" || {
+			printf 'diagnose_oom_run: API request failed while searching for run %s\n' "$run" >&2
+			return 1
+		}
+
+		rows="$(jq -r '.workflows[].workflow | "\(.id)\t\(.runName)\t\(.status)"' <<<"$rows")"
+	fi
 	if [ -z "$rows" ]; then
 		printf 'diagnose_oom_run: no workflow found matching run %s\n' "$run" >&2
 		return 1
@@ -1074,6 +1192,24 @@ _dr_resolve_workflow_id() {
 	cut -f1 <<<"$chosen"                                  # bare ID to stdout
 }
 
+# --- AWS: a self-hosted run's head jobs --------------------------------------
+# "<jobId>\t<jobName>\t<status>" for every head job named run-<id>; when one of
+# them is RUNNING (a relaunch reuses the name), only the RUNNING ones.
+#   $1 = run-<secondaryAnalysisId> or the bare secondaryAnalysisId
+_dr_selfhosted_head_jobs() {
+	local name="$1" rows running
+	case "$name" in
+	run-*) ;;
+	*) name="run-$name" ;;
+	esac
+	rows="$(_xsh_aws_query "batch list-jobs" batch list-jobs \
+		--job-queue "nf-secondary-head-${NF_SECONDARY_ENV:-production}" \
+		--filters "name=JOB_NAME,values=$name" \
+		--query 'jobSummaryList[].[jobId,jobName,status]' --output text)" || return 1
+	running="$(awk -F'\t' '$3=="RUNNING"' <<<"$rows")"
+	printf '%s\n' "${running:-$rows}" | grep . || true
+}
+
 # --- API: list a workflow's RUNNING tasks ------------------------------------
 # Emits one TSV row per RUNNING task: "<nativeId>\t<label>\t<workdir>\t<container>"
 # where label is "sample=<tag> step=<process>". The workdir + container image
@@ -1084,9 +1220,21 @@ _dr_list_running_tasks() {
 		printf 'Usage: diagnose_oom_run list <workflow-id>\n' >&2
 		return 2
 	fi
-	_dr_preflight curl jq || return 1
 
 	local wf="$1"
+	if [ "$(_xsh_source "$wf")" = selfhosted ]; then
+		_dr_preflight selfhosted aws awk || return 1
+		local rows nid name workdir image
+		rows="$(_xsh_selfhosted_task_jobs RUNNING)" || return 1
+		awk -F'\t' -v wf="$wf" 'BEGIN { OFS = "\t" } $4==wf { print $1, $2, $6, $7 }' <<<"$rows" |
+			while IFS=$'\t' read -r nid name workdir image; do
+				[ -z "$nid" ] && continue
+				printf '%s\t%s\t%s\t%s\n' "$nid" "$(_xsh_selfhosted_task_label "$workdir" "$name")" "$workdir" "$image"
+			done
+		return 0
+	fi
+	_dr_preflight seqera curl jq || return 1
+
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
 	local ep="${API_ENDPOINT%/}"
 	local offset=0 total page
@@ -1113,6 +1261,19 @@ _dr_list_running_tasks() {
 		offset=$((offset + 100))
 		[ "$offset" -ge "$total" ] && break
 	done
+}
+
+# --- self-hosted: Mountpoint's warnings and errors on one instance ------------
+# The self-hosted boot script ships each S3 mount's log to CloudWatch, one stream
+# per <instance>/<bucket>. Besides its startup lines, Mountpoint logs only warnings
+# and errors, so no lines is normal.
+#   $1 = EC2 instance id   $2 = minutes to look back (default 60)
+_dr_mountpoint_log() {
+	local group="/aws/batch/nf-secondary-mountpoint-${NF_SECONDARY_ENV:-production}"
+	local since=$((($(date +%s) - ${2:-60} * 60) * 1000))
+	_xsh_aws_query "logs filter-log-events $group" logs filter-log-events \
+		--log-group-name "$group" --log-stream-name-prefix "$1/" --start-time "$since" \
+		--filter-pattern '?WARN ?ERROR' --query 'events[-20:].[logStreamName,message]' --output text
 }
 
 # --- shared: the set of functions a probe needs shipped with it --------------
@@ -1160,15 +1321,43 @@ ${call}"
 	_xsh_ssm_run "$instance" "$remote_script" "$comment"
 }
 
+# --- shared: host-side snippet that finds a task's container ----------------
+# Emits shell text for a host script that already defines nid and fusion; it
+# sets cid to the running container of that task, or leaves it empty. The match
+# is exact and independent of process/clock state: AWS Batch puts the job id in
+# every task container's environment (AWS_BATCH_JOB_ID), on both runners; a
+# Seqera/Fusion task container is also launched to run <workdir>/.command.run
+# through its /fusion/s3 mount, which its launch config embeds.
+_xsh_find_task_container_src() {
+	cat <<'SRC'
+for c in $(sudo docker ps --no-trunc --format '{{.ID}}'); do
+	if [ -n "$nid" ] && sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null |
+		grep -qxF -- "AWS_BATCH_JOB_ID=$nid"; then
+		cid=$c
+		break
+	fi
+done
+if [ -z "$cid" ]; then
+	for c in $(sudo docker ps --no-trunc --format '{{.ID}}'); do
+		if sudo docker inspect "$c" 2>/dev/null | grep -qF -- "$fusion"; then
+			cid=$c
+			break
+		fi
+	done
+fi
+SRC
+}
+
 # --- diagnostic: run one PROBE INSIDE a task's container via SSM -------------
 # The task-scoped path (mirrors _sp_run_remote). Finds THIS task's container on
-# the host -- by the work dir embedded in its immutable launch config, falling
-# back to the image tag -- then docker-exec's the procps-free probe inside it,
-# so the probe sees only this task's PID namespace. No cross-task pollution.
+# the host (_xsh_find_task_container_src), falling back to the image tag, then
+# docker-exec's the procps-free probe inside it, so the probe sees only this
+# task's PID namespace. No cross-task pollution.
 #   $1 = EC2 instance id   $2 = container image ref   $3 = s3:// work directory
 #   $4 = process pattern   $5 = extra flags (e.g. --all)   $6 = probe: oom|stall
+#   $7 = the task's native id (Batch job id)
 _dr_run_in_container() {
-	local instance="$1" image="$2" workdir="$3" pattern="$4" extra="$5" probe="${6:-stall}"
+	local instance="$1" image="$2" workdir="$3" pattern="$4" extra="$5" probe="${6:-stall}" nid="${7:-}"
 	local tag="${image##*:}"
 	local fusion="/fusion/s3/${workdir#s3://}"
 	local func_src call comment inner_script b64 host_script
@@ -1199,22 +1388,18 @@ ${call}"
 image=$(printf '%q' "$image")
 tag=$(printf '%q' "$tag")
 fusion=$(printf '%q' "$fusion")
+nid=$(printf '%q' "$nid")
 b64=$(printf '%q' "$b64")
 
 cid=\"\"
-for c in \$(sudo docker ps --no-trunc --format '{{.ID}}'); do
-	if sudo docker inspect \"\$c\" 2>/dev/null | grep -qF -- \"\$fusion\"; then
-		cid=\$c
-		break
-	fi
-done
+$(_xsh_find_task_container_src)
 if [ -z \"\$cid\" ]; then
 	cid=\$(sudo docker ps --no-trunc | grep -F -- \"\$tag\" | awk '{print \$1}' | head -1)
-	[ -n \"\$cid\" ] && echo \"WARN: no container config referenced \$fusion; falling back to first \$tag container (\$cid). It may belong to a different task.\" >&2
+	[ -n \"\$cid\" ] && echo \"WARN: no container has AWS_BATCH_JOB_ID=\$nid or references \$fusion; falling back to first \$tag container (\$cid). It may belong to a different task.\" >&2
 fi
 if [ -z \"\$cid\" ]; then
 	# stdout (not stderr) so the orchestrator captures + detects this sentinel.
-	echo \">>> NO-CONTAINER: no running container for image \$image (searched by work dir and tag \$tag).\"
+	echo \">>> NO-CONTAINER: no running container for image \$image (searched by job id, work dir and tag \$tag).\"
 	exit 1
 fi
 echo \"Container id    : \$cid\"
@@ -1526,7 +1711,7 @@ _dr_diagnose_tasks() {
 		for pr in $probes; do
 			printf '    -- probe: %s --\n' "$pr"
 			if [ "$scoped" -eq 1 ]; then
-				out="$(_dr_run_in_container "$ec2" "$container" "$workdir" "$pattern" "$show_all" "$pr")"
+				out="$(_dr_run_in_container "$ec2" "$container" "$workdir" "$pattern" "$show_all" "$pr" "$nid")"
 			else
 				out="$(_dr_run_remote "$ec2" "$pattern" "$show_all" "$pr")"
 			fi
@@ -1564,6 +1749,15 @@ _dr_diagnose_tasks() {
 				fi
 			fi
 		done
+
+		if [ "$(_xsh_source "${_dr_wf:-}")" = selfhosted ] && out="$(_dr_mountpoint_log "$ec2")"; then
+			printf '    -- mountpoint log (last hour) --\n'
+			if [ -z "$out" ]; then
+				printf '    mountpoint: no warnings or errors.\n' | _dr_colorize
+			else
+				printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
+			fi
+		fi
 	done 3<"$worklist"
 
 	# summary
@@ -1586,6 +1780,8 @@ _dr_diagnose_tasks() {
 _dr_diagnose_workflow() {
 	local wf="$1"
 	shift
+	# read by _dr_diagnose_tasks (dynamic scope) to pick the run's source
+	local _dr_wf="$wf"
 
 	local tasks
 	tasks="$(_dr_list_running_tasks "$wf")" || return 1
@@ -1617,9 +1813,9 @@ _dr_diagnose_run_id() {
 # diagnose_run command implementation
 # =============================================================================
 _dr_main() {
-	# --aws-profile is accepted anywhere (before or after a subcommand), so pull
-	# it out before any other parsing sees it.
-	local profile="" profile_set=0
+	# --aws-profile and --source are accepted anywhere (before or after a
+	# subcommand), so pull them out before any other parsing sees them.
+	local profile="" profile_set=0 source="" source_set=0
 	local -a args=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -1630,6 +1826,13 @@ _dr_main() {
 		--aws-profile=*)
 			profile="${1#*=}" profile_set=1
 			;;
+		--source)
+			source="${2:-}" source_set=1
+			[ $# -ge 2 ] && shift
+			;;
+		--source=*)
+			source="${1#*=}" source_set=1
+			;;
 		*) args+=("$1") ;;
 		esac
 		shift
@@ -1638,6 +1841,10 @@ _dr_main() {
 	if [ "$profile_set" -eq 1 ]; then
 		_xsh_check_profile "$profile" diagnose_run || return 2
 		local -x AWS_PROFILE="$profile"
+	fi
+	if [ "$source_set" -eq 1 ]; then
+		_xsh_check_source "$source" diagnose_run || return 2
+		local -x XSH_SOURCE="$source"
 	fi
 
 	# Subcommand and help forms.
@@ -1717,17 +1924,32 @@ _dr_main() {
 # Public: find which workflow/run owns a task with a given tag
 # -----------------------------------------------------------------------------
 # Usage:
-#   find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
-#     --status S   only scan workflows in status S (default RUNNING; ALL = any)
-#     --max N      scan at most N workflows (default 200)
+#   find_run_by_task_tag [--status S|ALL] [--max N] [--all] [--source S] <tag>
+#     --status S   only scan workflows in status S (default RUNNING; ALL = any).
+#                  Self-hosted: the task's Batch job status (RUNNING, SUCCEEDED,
+#                  FAILED, ...) in the nf-secondary-work*-$NF_SECONDARY_ENV queues
+#     --max N      scan at most N workflows (default 200; Seqera only)
 #     --all        report every matching run (default: stop at the first)
+#     --source S   seqera | selfhosted (default: Seqera when API_* is set)
 #
-# Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
+# Required environment for Seqera: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
 # =============================================================================
 find_run_by_task_tag() {
-	local status_filter="RUNNING" max_wf=200 find_all=0 tag=""
+	local status_filter="RUNNING" max_wf=200 find_all=0 tag="" source=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
+		--source)
+			[ -n "${2:-}" ] || {
+				printf 'Error: --source requires a value.\n' >&2
+				return 2
+			}
+			source="$2"
+			shift 2
+			;;
+		--source=*)
+			source="${1#*=}"
+			shift
+			;;
 		--status)
 			[ -n "${2:-}" ] || {
 				printf 'Error: --status requires a value.\n' >&2
@@ -1757,7 +1979,7 @@ find_run_by_task_tag() {
 			shift
 			;;
 		-h | --help)
-			printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>\n'
+			printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] [--source seqera|selfhosted] <tag>\n'
 			return 0
 			;;
 		-*)
@@ -1777,10 +1999,20 @@ find_run_by_task_tag() {
 
 	[ -z "$tag" ] && {
 		printf 'Error: missing required <tag> argument.\n' >&2
-		printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>\n' >&2
+		printf 'Usage: find_run_by_task_tag [--status S|ALL] [--max N] [--all] [--source seqera|selfhosted] <tag>\n' >&2
 		return 2
 	}
-	_dr_preflight curl jq awk || return 1
+	if [ -n "$source" ]; then
+		_xsh_check_source "$source" find_run_by_task_tag || return 2
+		local -x XSH_SOURCE="$source"
+	fi
+	if [ "$(_xsh_source)" = selfhosted ]; then
+		_dr_preflight selfhosted aws awk || return 1
+		_xsh_require_aws_region find_run_by_task_tag || return 2
+		_frt_selfhosted "$status_filter" "$find_all" "$tag"
+		return
+	fi
+	_dr_preflight seqera curl jq awk || return 1
 
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
 	local ep="${API_ENDPOINT%/}"
@@ -1846,6 +2078,38 @@ find_run_by_task_tag() {
 	fi
 }
 
+# --- self-hosted: find the run of a task tag in the Batch work queues --------
+# Batch job names are the Nextflow task name with spaces turned into '_' and
+# every other character outside [A-Za-z0-9_-] dropped (WT:ALIGN (S1) ->
+# WTALIGN_S1), so the tag is matched against the job name the same way.
+#   $1 = status (RUNNING | ALL | a Batch job status)   $2 = 1 to report all   $3 = tag
+_frt_selfhosted() {
+	local statuses="$1" find_all="$2" tag="$3" rows matches
+	[ "$statuses" = ALL ] && statuses="SUBMITTED PENDING RUNNABLE STARTING RUNNING SUCCEEDED FAILED"
+
+	printf '==> Scanning %s self-hosted task(s) for a task tagged like "%s"...\n' "$1" "$tag" >&2
+	rows="$(_xsh_selfhosted_task_jobs "$statuses")" || return 1
+	matches="$(awk -F'\t' -v t="$tag" '
+		BEGIN { gsub(/ /, "_", t); gsub(/[^A-Za-z0-9_-]/, "", t) }
+		index($2, t) > 0' <<<"$rows")"
+	if [ -z "$matches" ]; then
+		printf 'No %s self-hosted task tagged like "%s" found (queues nf-secondary-work*-%s).\n' \
+			"$1" "$tag" "${NF_SECONDARY_ENV:-production}" >&2
+		return 1
+	fi
+
+	# one block per workflow, in first-seen order
+	local wid
+	for wid in $(cut -f4 <<<"$matches" | awk '!seen[$0]++'); do
+		printf '\n=== MATCH ===\n'
+		printf '  workflow id : %s\n' "$wid"
+		printf '  run name    : %s\n' "$(awk -F'\t' -v w="$wid" '$4==w { print $5; exit }' <<<"$matches")"
+		printf '  matching task(s):\n'
+		awk -F'\t' -v w="$wid" '$4==w { printf "    - nativeId=%s  job=%s  status=%s\n", $1, $2, $3 }' <<<"$matches"
+		[ "$find_all" -eq 0 ] && return 0
+	done
+}
+
 # =============================================================================
 # Public script entry point
 # -----------------------------------------------------------------------------
@@ -1857,6 +2121,13 @@ _xsh_usage() {
 	cat <<'EOF'
 Usage:
   x.sh [--aws-profile NAME] <command> [args...]
+
+Seqera and self-hosted runs:
+  A self-hosted run (Nextflow on the nf-secondary-*-$NF_SECONDARY_ENV Batch
+  queues, default production) is looked up in AWS Batch: its workflow id is the
+  head job's Batch job id (a UUID). diagnose_*run and find_run_by_task_tag take
+  --source seqera|selfhosted (or XSH_SOURCE); by default a workflow id's format
+  decides, and a run name goes to Seqera when API_* is set.
 
 Global options:
   --aws-profile NAME
@@ -1885,7 +2156,7 @@ Commands:
       tasks don't pollute each other. diagnose_stall_run and diagnose_oom_run
       are aliases pinned to one probe.
 
-  find_run_by_task_tag [--status S|ALL] [--max N] [--all] <tag>
+  find_run_by_task_tag [--status S|ALL] [--max N] [--all] [--source S] <tag>
       Find which workflow/run owns a task with the given tag.
 
   show_star_progress --fastq FILE --progress-file FILE [--sample-reads N]
@@ -2209,7 +2480,19 @@ EOF
 # same paginated /workflow/<id>/tasks endpoint as _dr_list_running_tasks.
 _sp_task_info() {
 	local wf="$1" nid="$2"
-	_dr_preflight curl jq || return 1
+	if [ "$(_xsh_source "$wf")" = selfhosted ]; then
+		_dr_preflight selfhosted aws awk || return 1
+		local row
+		row="$(_xsh_selfhosted_describe_jobs "$nid")" || return 1
+		row="$(awk -F'\t' -v w="$wf" 'BEGIN { OFS = "\t" } $4==w { print $6, $7 }' <<<"$row")"
+		[ -n "${row%%$'\t'*}" ] && {
+			printf '%s\n' "$row"
+			return 0
+		}
+		printf 'show_task_star_progress: no task with nativeId %s found in workflow %s\n' "$nid" "$wf" >&2
+		return 1
+	fi
+	_dr_preflight seqera curl jq || return 1
 
 	local auth=(-H "Authorization: Bearer $API_ACCESS_TOKEN")
 	local ep="${API_ENDPOINT%/}"
@@ -2244,23 +2527,31 @@ _sp_task_info() {
 }
 
 # --- container driver: shipped INTO the task container and run there ---------
-# Converts the task's s3:// workdir to its /fusion/s3 mount, finds the single
-# *_ALIGN output directory under it, and invokes show_star_progress on the fixed
-# barcode_head FASTQ + Log.progress.out paths. Runs inside the container so it
-# sees the same fusion mount and GNU coreutils the task itself used.
+# Finds the task's working directory -- the /fusion/s3 mount of its s3:// workdir
+# on Seqera, or on self-hosted Batch (no Fusion) the /tmp/nxf.* scratch dir its
+# processes run in -- then the single *_ALIGN output directory under it, and
+# invokes show_star_progress on the fixed barcode_head FASTQ + Log.progress.out
+# paths. Runs inside the container so it sees the same mounts and GNU coreutils
+# the task itself used. Every task's scratch dir on the host is visible under
+# /tmp, so the scratch dir is taken from this container's own processes.
 #   $1 = s3:// work directory of the task
 _sp_container_driver() {
 	local workdir="$1"
-	local fusion="/fusion/s3/${workdir#s3://}"
+	local taskdir="/fusion/s3/${workdir#s3://}" p
+
+	if [ ! -d "$taskdir" ]; then
+		taskdir="$(for p in /proc/[0-9]*; do readlink "$p/cwd" 2>/dev/null; done |
+			sed -n 's#^\(/tmp/nxf\.[^/]*\).*#\1#p' | sort | uniq -c | sort -rn | awk 'NR==1 { print $2 }')"
+	fi
 
 	local align_dir
-	align_dir="$(ls -d "$fusion"/*_ALIGN 2>/dev/null | head -1)"
+	align_dir="$(ls -d "$taskdir"/*_ALIGN 2>/dev/null | head -1)"
 	if [ -z "$align_dir" ]; then
-		echo "No *_ALIGN directory found under $fusion" >&2
+		echo "No *_ALIGN directory found under ${taskdir:-/fusion/s3 or /tmp/nxf.*}" >&2
 		return 1
 	fi
 
-	echo "Work directory  : $fusion"
+	echo "Work directory  : $taskdir"
 	echo "ALIGN directory : $align_dir"
 	echo
 	show_star_progress \
@@ -2276,8 +2567,9 @@ _sp_container_driver() {
 #     embedded in the container's launch config, falling back to image tag),
 #     decode the inner script, and pipe it into `sudo docker exec -i <cid> bash -s`.
 #   $1 = EC2 instance id   $2 = container image ref   $3 = s3:// work directory
+#   $4 = the task's native id (Batch job id)
 _sp_run_remote() {
-	local instance="$1" image="$2" workdir="$3"
+	local instance="$1" image="$2" workdir="$3" nid="${4:-}"
 	local tag="${image##*:}"
 	local fusion="/fusion/s3/${workdir#s3://}"
 	local inner_src inner_script b64 host_script
@@ -2294,32 +2586,23 @@ _sp_container_driver $(printf '%q' "$workdir")"
 image=$(printf '%q' "$image")
 tag=$(printf '%q' "$tag")
 fusion=$(printf '%q' "$fusion")
+nid=$(printf '%q' "$nid")
 b64=$(printf '%q' "$b64")
 
 # Pick the container running THIS task, not just any container sharing the
 # image tag. The image tag is NOT unique per task -- a host commonly runs
 # several containers of the same image, so 'grep tag | head -1' can land in a
 # different task's container (where this task's STAR is invisible, since each
-# container has its own PID namespace). Every Nextflow/fusion task container is
-# launched to run <workdir>/.command.run, so the task's unique work directory is
-# embedded in the container's immutable launch config: inspect each running
-# container and match on it. This is exact and independent of process/clock
-# state (unlike matching container start time to the task's execution time,
-# which breaks when a container outlives or predates the task).
+# container has its own PID namespace). See _xsh_find_task_container_src.
 cid=\"\"
-for c in \$(sudo docker ps --no-trunc --format '{{.ID}}'); do
-	if sudo docker inspect \"\$c\" 2>/dev/null | grep -qF -- \"\$fusion\"; then
-		cid=\$c
-		break
-	fi
-done
+$(_xsh_find_task_container_src)
 if [ -z \"\$cid\" ]; then
 	# Fallback: first running container matching the image tag (old behaviour).
 	cid=\$(sudo docker ps --no-trunc | grep -F -- \"\$tag\" | awk '{print \$1}' | head -1)
-	[ -n \"\$cid\" ] && echo \"WARN: no container config referenced \$fusion; falling back to first \$tag container (\$cid). It may belong to a different task.\" >&2
+	[ -n \"\$cid\" ] && echo \"WARN: no container has AWS_BATCH_JOB_ID=\$nid or references \$fusion; falling back to first \$tag container (\$cid). It may belong to a different task.\" >&2
 fi
 if [ -z \"\$cid\" ]; then
-	echo \"No running container found for image \$image (searched by work dir and tag \$tag)\" >&2
+	echo \"No running container found for image \$image (searched by job id, work dir and tag \$tag)\" >&2
 	exit 1
 fi
 echo \"Container image : \$image\"
@@ -2336,18 +2619,20 @@ show_task_star_progress() {
 	read -r -d '' usage <<'EOF' || true
 Usage: show_task_star_progress [--aws-profile NAME] --workflow-id <id> --native-id <nativeId>
 
-Resolve a STAR alignment task's work directory and container image via the
-Tower API, trace its nativeId to the backing EC2 instance, find the running task
-container there, and run show_star_progress inside it against the task's barcode_head
-FASTQ and Log.progress.out.
+Resolve a STAR alignment task's work directory and container image (via the
+Tower API for a Seqera run, AWS Batch for a self-hosted one), trace its nativeId
+to the backing EC2 instance, find the running task container there, and run
+show_star_progress inside it against the task's barcode_head FASTQ and
+Log.progress.out.
 
 Options:
-  --workflow-id <id>   Tower workflow ID that owns the task.
+  --workflow-id <id>   Workflow ID that owns the task: a Seqera workflow ID, or
+                       a self-hosted run's head job ID (a UUID).
   --native-id <id>     Task nativeId (AWS Batch job UUID).
   --aws-profile NAME   AWS CLI profile to use (default: $AWS_PROFILE / CLI default).
   -h, --help           Show this help message and exit.
 
-Required environment: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
+Required environment for Seqera runs: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT
 Requirements: aws (SSM), curl, jq.
 
 Example:
@@ -2451,7 +2736,7 @@ EOF
 	printf '    EC2 instance: %s\n' "$ec2" >&2
 
 	printf '==> Running show_star_progress inside the task container on %s...\n' "$ec2" >&2
-	_sp_run_remote "$ec2" "$image" "$workdir"
+	_sp_run_remote "$ec2" "$image" "$workdir" "$nid"
 }
 
 # =============================================================================
