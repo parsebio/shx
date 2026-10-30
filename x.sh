@@ -1104,6 +1104,8 @@ Aliases: diagnose_stall_run pins --check stall; diagnose_oom_run pins --check oo
 Required environment for Seqera runs: API_ACCESS_TOKEN, WORKSPACE_ID, API_ENDPOINT.
 Self-hosted runs are read from AWS Batch (queues nf-secondary-*-$NF_SECONDARY_ENV,
 default production); --run-id takes run-<secondaryAnalysisId> or the bare id.
+Each self-hosted task also shows its instance's Mountpoint (S3 mount) warnings and
+errors from the last hour, read from CloudWatch: the replacement for .fusion.log.
 EOF
 }
 
@@ -1259,6 +1261,19 @@ _dr_list_running_tasks() {
 		offset=$((offset + 100))
 		[ "$offset" -ge "$total" ] && break
 	done
+}
+
+# --- self-hosted: Mountpoint's warnings and errors on one instance ------------
+# The self-hosted boot script ships each S3 mount's log to CloudWatch, one stream
+# per <instance>/<bucket>. Besides its startup lines, Mountpoint logs only warnings
+# and errors, so no lines is normal.
+#   $1 = EC2 instance id   $2 = minutes to look back (default 60)
+_dr_mountpoint_log() {
+	local group="/aws/batch/nf-secondary-mountpoint-${NF_SECONDARY_ENV:-production}"
+	local since=$((($(date +%s) - ${2:-60} * 60) * 1000))
+	_xsh_aws_query "logs filter-log-events $group" logs filter-log-events \
+		--log-group-name "$group" --log-stream-name-prefix "$1/" --start-time "$since" \
+		--filter-pattern '?WARN ?ERROR' --query 'events[-20:].[logStreamName,message]' --output text
 }
 
 # --- shared: the set of functions a probe needs shipped with it --------------
@@ -1734,6 +1749,15 @@ _dr_diagnose_tasks() {
 				fi
 			fi
 		done
+
+		if [ "$(_xsh_source "${_dr_wf:-}")" = selfhosted ] && out="$(_dr_mountpoint_log "$ec2")"; then
+			printf '    -- mountpoint log (last hour) --\n'
+			if [ -z "$out" ]; then
+				printf '    mountpoint: no warnings or errors.\n' | _dr_colorize
+			else
+				printf '%s\n' "$out" | sed 's/^/    | /' | _dr_colorize
+			fi
+		fi
 	done 3<"$worklist"
 
 	# summary
@@ -1756,6 +1780,8 @@ _dr_diagnose_tasks() {
 _dr_diagnose_workflow() {
 	local wf="$1"
 	shift
+	# read by _dr_diagnose_tasks (dynamic scope) to pick the run's source
+	local _dr_wf="$wf"
 
 	local tasks
 	tasks="$(_dr_list_running_tasks "$wf")" || return 1
